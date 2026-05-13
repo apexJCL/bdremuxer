@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 //
-// M2: scan → probe → classify → identify (movie) → select (main feature).
-// No remuxing — prints the proposed plan and stops.
+// M3: scan → probe → classify → identify (movie) → select → remux → finalize.
+// Movie discs only; TV bounces with a "lands in M4" message.
 
 import { parseArgs } from "node:util";
 import { statSync } from "node:fs";
@@ -14,7 +14,7 @@ import { CINFO } from "./makemkv/codes.ts";
 
 import { loadConfig } from "./config.ts";
 import { openDb } from "./db.ts";
-import type { DiscRow, TitleRow } from "./db.ts";
+import type { DiscRow, MovieRow, TitleRow } from "./db.ts";
 
 import { scan } from "./pipeline/scan.ts";
 import { persistProbe } from "./pipeline/probe.ts";
@@ -25,30 +25,41 @@ import {
   persistMovie,
 } from "./pipeline/identify/movie.ts";
 import { persistMovieSelection, selectMovie } from "./pipeline/select/movie.ts";
+import type { MovieSelection } from "./pipeline/select/movie.ts";
+import { remuxMovieMain } from "./pipeline/remux.ts";
+import { finalize } from "./pipeline/finalize.ts";
+import {
+  finishRun,
+  markDiscFailed,
+  startRun,
+} from "./pipeline/run.ts";
 import { TmdbClient } from "./metadata/tmdb.ts";
 
 import { formatHms, parseDurationFlag } from "./parse/duration.ts";
 
-const HELP = `bdremuxer (M2)
+import { version as PKG_VERSION } from "../package.json";
+
+const HELP = `bdremuxer (M3)
 
 Usage:
   bdremuxer <BDMV path> [options]
 
 Identification:
-  --type movie|tv          override auto-classification (M2 only handles 'movie')
+  --type movie|tv          override auto-classification (M3 only handles 'movie')
   --title "Name (Year)"    search query hint
   --tmdb-id N              skip search, fetch this TMDB id directly
   --imdb-id ttN            skip search, look up by IMDb id
 
 Selection:
-  --include-extras
+  --include-extras                       (kept off in M3; main feature only)
   --min-length-skip <N>(s|m|h) | false   default: 90s
 
 Paths / behaviour:
   --out DIR                output directory (also where the SQLite DB lives)
   --db PATH                override the SQLite DB path
   --makemkvcon PATH        override the makemkvcon binary
-  --force                  re-run from probe even if disc.status='done' (M2: no-op)
+  --dry-run                stop after select, print plan (no remux)
+  --force                  re-run remux even if disc.status='done'
   -v, --verbose
   -h, --help
 
@@ -73,6 +84,7 @@ async function main(argv: string[]): Promise<number> {
         out: { type: "string" },
         db: { type: "string" },
         makemkvcon: { type: "string" },
+        "dry-run": { type: "boolean" },
         force: { type: "boolean" },
         verbose: { type: "boolean", short: "v" },
         help: { type: "boolean", short: "h" },
@@ -132,9 +144,11 @@ async function main(argv: string[]): Promise<number> {
   const log = (msg: string) => {
     if (values.verbose) process.stderr.write(`[bdremuxer] ${msg}\n`);
   };
+  log(`bdremuxer v${PKG_VERSION}`);
   log(`makemkvcon: ${makemkvcon}`);
   log(`disc root:  ${discRoot}`);
-  log(`db path:    ${cfg.dbPath}`);
+  log(`out:        ${cfg.outDir}`);
+  log(`db:         ${cfg.dbPath}`);
 
   const db = openDb(cfg.dbPath);
 
@@ -142,10 +156,27 @@ async function main(argv: string[]): Promise<number> {
     // §5.1 Scan
     log("scan...");
     const scanRes = await scan(db, discRoot);
-    log(`fingerprint: ${scanRes.fingerprint.slice(0, 16)}…`);
+    const shortFp = scanRes.fingerprint.slice(0, 12);
+    log(`fingerprint: ${shortFp}…`);
+
+    // Early-out: if a previous run finished cleanly and the user isn't
+    // forcing, skip without spawning makemkvcon at all.
+    if (!values.force && scanRes.disc.status === "done") {
+      const existing = db
+        .query<{ output_path: string | null }, [number]>(
+          `SELECT output_path FROM title WHERE disc_id = ? AND role = 'main'`,
+        )
+        .get(scanRes.disc.id);
+      process.stdout.write(
+        `Disc already processed (status=done).\n` +
+          (existing?.output_path ? `  Output: ${existing.output_path}\n` : "") +
+          `  Pass --force to re-run.\n`,
+      );
+      return 0;
+    }
 
     // §5.2 Probe
-    log("probe (running makemkvcon info — this can take a while)...");
+    log("probe...");
     const { probe } = await runInfo({
       makemkvcon,
       source: `file:${discRoot}`,
@@ -178,9 +209,7 @@ async function main(argv: string[]): Promise<number> {
     log(`classified: ${kind}`);
 
     if (kind === "tv") {
-      process.stderr.write(
-        "TV box-set support arrives in M4. For now M2 stops here.\n",
-      );
+      process.stderr.write("TV box-set support arrives in M4.\n");
       return 1;
     }
 
@@ -217,7 +246,7 @@ async function main(argv: string[]): Promise<number> {
     );
     log(`identified: tmdb=${movie.tmdb_id} imdb=${movie.imdb_id ?? "-"}`);
 
-    // §5.5 Select titles (movie path)
+    // §5.5 Select
     const selection = selectMovie({
       titles: titleRows,
       minLengthSkipS,
@@ -227,14 +256,69 @@ async function main(argv: string[]): Promise<number> {
     persistMovieSelection(db, discIdentified.id, selection);
     log("selected");
 
-    printPlan({
-      disc: discIdentified,
-      movie,
-      probe,
-      selection,
-      source: identified.source,
-    });
-    return 0;
+    // --dry-run: stop after select, print the plan as M2 did.
+    if (values["dry-run"]) {
+      printPlan({
+        disc: discIdentified,
+        movie,
+        probe,
+        selection,
+        source: identified.source,
+        dryRun: true,
+      });
+      return 0;
+    }
+
+    // §5.6 Remux + §5.7 Finalize
+    const runId = startRun(db, discIdentified.id);
+
+    try {
+      const remuxResult = await remuxMovieMain({
+        db,
+        outDir: cfg.outDir,
+        makemkvcon,
+        discRoot,
+        disc: discIdentified,
+        movie,
+        mainTitle: selection.main,
+        runId,
+        force: !!values.force,
+        shortFp,
+        onProgress: makeProgressPrinter(),
+      });
+      // newline after the \r-overwritten progress line
+      process.stderr.write("\n");
+
+      // Re-read titles so manifest reflects the persisted roles & output_path
+      const titlesAfter = db
+        .query<TitleRow, [number]>(`SELECT * FROM title WHERE disc_id = ? ORDER BY makemkv_id`)
+        .all(discIdentified.id);
+
+      const { manifestPath } = finalize({
+        db,
+        outDir: cfg.outDir,
+        disc: { ...discIdentified, status: "remuxed" },
+        movie,
+        titles: titlesAfter,
+        runId,
+        shortFp,
+        bdremuxerVersion: PKG_VERSION,
+      });
+
+      printDone({
+        disc: discIdentified,
+        movie,
+        outputPath: remuxResult.outputPath,
+        manifestPath,
+        skipped: remuxResult.skipped,
+        logPath: remuxResult.logPath,
+      });
+      return 0;
+    } catch (e) {
+      finishRun(db, runId, false);
+      markDiscFailed(db, discIdentified.id, "remuxed");
+      throw e;
+    }
   } catch (e) {
     process.stderr.write(`Error: ${(e as Error).message}\n`);
     return 1;
@@ -243,20 +327,37 @@ async function main(argv: string[]): Promise<number> {
   }
 }
 
+// ---- progress ----------------------------------------------------------
+
+function makeProgressPrinter(): (frac: number, task?: string) => void {
+  let lastPct = -1;
+  let lastTask = "";
+  return (frac, task) => {
+    const pct = Math.floor(frac * 100);
+    if (pct === lastPct && task === lastTask) return;
+    lastPct = pct;
+    lastTask = task ?? lastTask;
+    const bar = renderBar(frac);
+    const label = task ? ` ${task}` : "";
+    process.stderr.write(`\rRemux: ${bar} ${pct.toString().padStart(3)}%${label}   `);
+  };
+}
+
+function renderBar(frac: number): string {
+  const width = 20;
+  const filled = Math.min(width, Math.max(0, Math.floor(frac * width)));
+  return `[${"#".repeat(filled)}${".".repeat(width - filled)}]`;
+}
+
 // ---- printing -----------------------------------------------------------
 
 type PlanInput = {
   disc: DiscRow;
-  movie: {
-    tmdb_id: number | null;
-    imdb_id: string | null;
-    title: string;
-    year: number | null;
-    runtime_min: number | null;
-  };
+  movie: Pick<MovieRow, "tmdb_id" | "imdb_id" | "title" | "year" | "runtime_min">;
   probe: RobotProbe;
-  selection: ReturnType<typeof selectMovie>;
+  selection: MovieSelection;
   source: string;
+  dryRun: boolean;
 };
 
 function printPlan(p: PlanInput): void {
@@ -267,16 +368,14 @@ function printPlan(p: PlanInput): void {
     p.disc.volume_label ??
     "(unknown)";
 
-  w(`Disc: ${discName}\n`);
+  w(`${p.dryRun ? "[dry-run] " : ""}Disc: ${discName}\n`);
   w(`  fingerprint: ${p.disc.fingerprint.slice(0, 12)}…\n`);
   w(`  status:      ${p.disc.status}\n`);
   w(`  kind:        ${p.disc.media_kind}\n`);
   w("\n");
 
   w(`Proposed match  (via ${p.source}):\n`);
-  w(
-    `  ${p.movie.title}${p.movie.year ? ` (${p.movie.year})` : ""}\n`,
-  );
+  w(`  ${p.movie.title}${p.movie.year ? ` (${p.movie.year})` : ""}\n`);
   w(`  TMDB:  ${p.movie.tmdb_id ?? "-"}\n`);
   w(`  IMDb:  ${p.movie.imdb_id ?? "-"}\n`);
   w(
@@ -300,6 +399,8 @@ function printPlan(p: PlanInput): void {
       );
     }
   }
+
+  if (p.dryRun) w("\nDry run — no remux performed.\n");
 }
 
 function printTitleLine(probe: RobotProbe, t: TitleRow): void {
@@ -312,12 +413,28 @@ function printTitleLine(probe: RobotProbe, t: TitleRow): void {
   if (info) {
     for (const sIdx of [...info.streams.keys()].sort((a, b) => a - b)) {
       const s = info.streams.get(sIdx)!;
-      const kind = s.get(1) ?? "?"; // SINFO.TYPE
+      const kind = s.get(1) ?? "?";
       const lang = s.get(3) ?? "---";
       const codec = s.get(6) ?? s.get(5) ?? "?";
       w(`      ${kind.padEnd(9)} ${lang.padEnd(4)} ${codec}\n`);
     }
   }
+}
+
+function printDone(p: {
+  disc: DiscRow;
+  movie: Pick<MovieRow, "title" | "year">;
+  outputPath: string;
+  manifestPath: string;
+  skipped: boolean;
+  logPath: string;
+}): void {
+  const w = (s: string) => process.stdout.write(s);
+  const verb = p.skipped ? "Already remuxed" : "Remuxed";
+  w(`\n${verb}: ${p.movie.title}${p.movie.year ? ` (${p.movie.year})` : ""}\n`);
+  w(`  Output:   ${p.outputPath}\n`);
+  w(`  Manifest: ${p.manifestPath}\n`);
+  w(`  Log:      ${p.logPath}\n`);
 }
 
 // ---- helpers ------------------------------------------------------------
