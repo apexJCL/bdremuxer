@@ -1,0 +1,17 @@
+{
+  "name": "bdremuxer",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "module": "src/cli.ts",
+  "scripts": {
+    "dev": "bun run ./src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "build": "bun build ./src/cli.ts --compile --minify --sourcemap --target=bun-darwin-arm64 --outfile dist/bdremuxer-macos-arm64"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.5.0"
+  }
+}

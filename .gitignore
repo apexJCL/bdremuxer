@@ -1,0 +1,13 @@
+node_modules/
+dist/
+
+# bdremuxer outputs (default --out location used in dev)
+out/
+
+# Logs / DB at repo root if someone runs `bdremuxer .`
+*.log
+*.sqlite
+*.sqlite-journal
+
+# OS
+.DS_Store
