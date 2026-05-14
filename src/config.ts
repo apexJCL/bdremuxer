@@ -13,12 +13,25 @@ export type Config = {
 };
 
 export type ConfigOverrides = {
+  /** Explicit CLI / batch override; wins over env + default. */
   outDir?: string;
   dbPath?: string;
+  /**
+   * Context-aware fallback used when neither --out nor the env var is
+   * set. For single-disc runs this is `dirname(discRoot)` (output lands
+   * as a sibling of the input); for batch runs this is the batch parent
+   * directory itself.
+   */
+  defaultOutDir?: string;
 };
 
 export function loadConfig(overrides: ConfigOverrides = {}): Config {
-  const outDir = resolve(overrides.outDir ?? process.env["BDREMUXER_OUTPUT_DIR"] ?? "./out");
+  const outDir = resolve(
+    overrides.outDir ??
+      process.env["BDREMUXER_OUTPUT_DIR"] ??
+      overrides.defaultOutDir ??
+      "./out",
+  );
   const dbPath = resolve(
     overrides.dbPath ??
       process.env["BDREMUXER_DB_PATH"] ??

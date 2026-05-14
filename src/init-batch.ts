@@ -13,11 +13,11 @@
 // cognitively heavy — the generated file includes TODO comments telling
 // the user to fill those in). Also doesn't hit TMDB.
 
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 
 import { walkBdmvFolders, type DiscDir } from "./batch.ts";
-import { parseSeasonHint } from "./parse/season-hint.ts";
+import { parseSeasonHint, parseSeasonHintFromPath } from "./parse/season-hint.ts";
 import type { Prompter } from "./parse/prompt.ts";
 
 // -----------------------------------------------------------------------
@@ -121,7 +121,10 @@ export function groupDiscs(discs: DiscDir[]): DiscGroup[] {
   const orphans: DiscDir[] = [];
 
   for (const d of sorted) {
-    const hint = parseSeasonHint(lastSegment(d.relPath));
+    // Walk every path segment — for layouts like
+    // "SHOW_S1_HDBEE/S1 D1" the parent dir often carries the show
+    // and the leaf carries the disc number.
+    const hint = parseSeasonHintFromPath(d.relPath);
     if (hint.show && hint.season != null) {
       const key = `${hint.show.toLowerCase()}|S${hint.season}`;
       let b = buckets.get(key);
@@ -205,6 +208,91 @@ export type SkippedAnswer = {
   members: DiscDir[];
 };
 
+// -----------------------------------------------------------------------
+// "Library shape" answer builders (pure)
+// -----------------------------------------------------------------------
+// The `mixed` shape uses groupDiscs + the per-group prompt loop below.
+// `tv-boxset` and `movie-discs` collapse all of those questions into a
+// single shared answer because every disc shares the same show/title.
+
+export type BoxsetShared = {
+  show: string;
+  tmdbShowId?: number;
+  includeExtras: boolean;
+};
+
+export function boxsetAnswers(
+  discs: DiscDir[],
+  shared: BoxsetShared,
+): WizardAnswers {
+  const sorted = [...discs].sort((a, b) => a.relPath.localeCompare(b.relPath));
+  const bySeason = new Map<number, DiscDir[]>();
+  const orphans: DiscDir[] = [];
+  for (const d of sorted) {
+    const hint = parseSeasonHintFromPath(d.relPath);
+    if (hint.season != null) {
+      let bucket = bySeason.get(hint.season);
+      if (!bucket) {
+        bucket = [];
+        bySeason.set(hint.season, bucket);
+      }
+      bucket.push(d);
+    } else {
+      orphans.push(d);
+    }
+  }
+  const answers: WizardAnswers = [];
+  const seasons = [...bySeason.keys()].sort((a, b) => a - b);
+  for (const s of seasons) {
+    answers.push({
+      kind: "tv-group",
+      members: bySeason.get(s)!,
+      show: shared.show,
+      season: s,
+      ...(shared.tmdbShowId !== undefined ? { tmdbShowId: shared.tmdbShowId } : {}),
+      includeExtras: shared.includeExtras,
+    });
+  }
+  // Discs we couldn't bucket by season still get the wizard's shared show
+  // + tmdb_show_id. They become per-disc TV singletons with a `# TODO: set
+  // season` comment so the user knows exactly which field is missing,
+  // rather than being silently skipped (which would discard the wizard
+  // input entirely).
+  for (const d of orphans) {
+    const singleton: SingletonAnswer = {
+      kind: "singleton",
+      member: d,
+      type: "tv",
+      show: shared.show,
+      ...(shared.tmdbShowId !== undefined ? { tmdbShowId: shared.tmdbShowId } : {}),
+      includeExtras: shared.includeExtras,
+    };
+    answers.push(singleton);
+  }
+  return answers;
+}
+
+export type MovieDiscsShared = {
+  title?: string;
+  tmdbId?: number;
+  includeExtras: boolean;
+};
+
+export function movieDiscsAnswers(
+  discs: DiscDir[],
+  shared: MovieDiscsShared,
+): WizardAnswers {
+  const sorted = [...discs].sort((a, b) => a.relPath.localeCompare(b.relPath));
+  return sorted.map((d): SingletonAnswer => ({
+    kind: "singleton",
+    member: d,
+    type: "movie",
+    ...(shared.title ? { title: shared.title } : {}),
+    ...(shared.tmdbId !== undefined ? { tmdbId: shared.tmdbId } : {}),
+    includeExtras: shared.includeExtras,
+  }));
+}
+
 function commonPrefix(strs: string[]): string {
   if (strs.length === 0) return "";
   let prefix = strs[0]!;
@@ -226,7 +314,17 @@ export function buildBatchBlocks(answers: WizardAnswers): WizardBlock[] {
       // If the discs literally share an identical prefix (e.g.
       // "Breaking Bad - S2 - Disc ") use `prefix*`; otherwise fall back
       // to a per-member listing under the group glob.
-      const glob = prefix !== "" ? `${prefix}*` : a.members[0]!.relPath;
+      //
+      // ISO members live one directory below the disc dir (relPath is
+      // "S4 D1/Show.Name.S04D01.iso"), so a single `*` — which doesn't
+      // cross `/` in our glob matcher (parse/glob.ts) — would fail to match.
+      // When any member is an ISO, widen the wildcard to `**` so the
+      // block covers both `S4 D1` (folder-backed sibling, if any) and
+      // `S4 D1/<iso-name>` (the ISO disc). Folder-only groups stay on
+      // `*` to avoid over-matching unrelated subtrees.
+      const anyIso = a.members.some((m) => m.kind === "iso");
+      const wildcard = anyIso ? "**" : "*";
+      const glob = prefix !== "" ? `${prefix}${wildcard}` : a.members[0]!.relPath;
       const values: WizardBlock["values"] = {
         type: "tv",
         show: a.show,
@@ -242,11 +340,18 @@ export function buildBatchBlocks(answers: WizardAnswers): WizardBlock[] {
         values,
       });
       // One block per disc with a TODO placeholder for starting_episode.
-      for (const m of a.members) {
+      // The comment names the group + position so re-reading the file later
+      // makes the multi-disc relationship obvious without having to cross-
+      // reference the glob block above.
+      const groupLabel = `${a.show} - S${a.season}`;
+      for (let i = 0; i < a.members.length; i++) {
+        const m = a.members[i]!;
         blocks.push({
           glob: m.relPath,
           values: { starting_episode: 1 },
-          comment: `TODO: change to the actual first-episode number on this disc.`,
+          comment:
+            `Disc ${i + 1} of ${a.members.length} in "${groupLabel}".\n` +
+            `TODO: set starting_episode to the first episode number on this disc.`,
         });
       }
       continue;
@@ -262,7 +367,16 @@ export function buildBatchBlocks(answers: WizardAnswers): WizardBlock[] {
       if (a.tmdbId !== undefined) values.tmdb_id = a.tmdbId;
     }
     if (a.includeExtras) values.include_extras = true;
-    blocks.push({ glob: a.member.relPath, values });
+    // Flag the missing-season case so the user notices on re-open.
+    const comment =
+      a.type === "tv" && a.season === undefined
+        ? `TODO: set season = N — couldn't auto-parse the season from this disc's path.`
+        : undefined;
+    blocks.push({
+      glob: a.member.relPath,
+      ...(comment ? { comment } : {}),
+      values,
+    });
   }
   return blocks;
 }
@@ -293,6 +407,75 @@ export function serializeBatchToml(blocks: WizardBlock[]): string {
 
 function escapeTomlString(s: string): string {
   return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+// -----------------------------------------------------------------------
+// Auto-patch starting_episode values back into bdremuxer.batch.toml
+// -----------------------------------------------------------------------
+//
+// After the wizard writes the initial TOML (every per-disc block has the
+// placeholder `starting_episode = 1`), we run a preflight pass. Discs
+// past the first in any season hit the EpisodeAllocationConflict guard,
+// which produces a structured `fix` telling us the right starting_episode.
+// This helper writes those values into the existing TOML in place,
+// preserving every comment and surrounding line.
+//
+// Returns the relPaths that were successfully patched. Anything missing
+// (block not found, or block has no `starting_episode = ...` line) is
+// reported in `unpatched` so the caller can surface it.
+
+export type StartingEpisodePatch = {
+  relPath: string;
+  startingEpisode: number;
+};
+
+export type PatchResult = {
+  patched: string[];
+  unpatched: StartingEpisodePatch[];
+};
+
+export function patchStartingEpisodes(
+  tomlPath: string,
+  patches: StartingEpisodePatch[],
+): PatchResult {
+  if (patches.length === 0) return { patched: [], unpatched: [] };
+  let text = readFileSync(tomlPath, "utf8");
+  const patched: string[] = [];
+  const unpatched: StartingEpisodePatch[] = [];
+  for (const p of patches) {
+    const updated = applySinglePatch(text, p);
+    if (updated === text) unpatched.push(p);
+    else {
+      patched.push(p.relPath);
+      text = updated;
+    }
+  }
+  if (patched.length > 0) writeFileSync(tomlPath, text);
+  return { patched, unpatched };
+}
+
+function applySinglePatch(text: string, p: StartingEpisodePatch): string {
+  // Locate the target block by its exact header line, then bound the
+  // search to that block by finding the next `["..."]` header. Patching
+  // a non-greedy match across the whole file would risk landing on the
+  // wrong block when the target had no starting_episode line.
+  const headerLine = `["${escapeTomlString(p.relPath)}"]`;
+  const headerIdx = text.indexOf(headerLine);
+  if (headerIdx === -1) return text;
+  const blockStart = headerIdx;
+  const after = text.slice(blockStart + headerLine.length);
+  const nextHeader = after.match(/^\["/m);
+  const blockEnd =
+    nextHeader && nextHeader.index !== undefined
+      ? blockStart + headerLine.length + nextHeader.index
+      : text.length;
+  const block = text.slice(blockStart, blockEnd);
+  const patchedBlock = block.replace(
+    /(\bstarting_episode\s*=\s*)(\d+)/,
+    `$1${p.startingEpisode}`,
+  );
+  if (patchedBlock === block) return text; // key not present in this block
+  return text.slice(0, blockStart) + patchedBlock + text.slice(blockEnd);
 }
 
 function tomlValue(v: string | number | boolean): string {
@@ -336,9 +519,76 @@ export async function runInitBatch(opts: RunInitBatchOpts): Promise<{
   const prompter = opts.prompter;
 
   process.stdout.write(`Found ${discs.length} disc(s) under ${parentAbs}\n\n`);
-  const groups = groupDiscs(discs);
+  const shape = await prompter.askChoice(
+    "Treat this directory as",
+    ["mixed", "tv-boxset", "movie-discs"] as const,
+    "mixed",
+  );
+  process.stdout.write("\n");
   const answers: WizardAnswers = [];
 
+  if (shape === "tv-boxset") {
+    process.stdout.write("All discs belong to one TV show.\n");
+    const show = await prompter.ask("  Show name");
+    const tmdbShowId = await prompter.askInt("  TMDB show id (optional, blank to search)");
+    const includeExtras = await prompter.askBool("  Include extras?", false);
+    process.stdout.write("\n");
+    answers.push(
+      ...boxsetAnswers(discs, {
+        show,
+        ...(tmdbShowId !== null ? { tmdbShowId } : {}),
+        includeExtras,
+      }),
+    );
+    // After M11.1, boxsetAnswers preserves orphans as singleton TV answers
+    // (with the shared show + tmdb_show_id), and the resulting per-disc
+    // blocks include a `# TODO: set season = N` comment. We surface the
+    // count here so the user knows how many to revisit.
+    const orphanCount = answers.filter(
+      (a) =>
+        a.kind === "singleton" &&
+        a.type === "tv" &&
+        a.season === undefined,
+    ).length;
+    if (orphanCount > 0) {
+      process.stdout.write(
+        `  ${orphanCount} disc(s) had no parseable season — emitted with TODO markers.\n` +
+          `  Edit the TOML to set season = N on each.\n\n`,
+      );
+    }
+  } else if (shape === "movie-discs") {
+    process.stdout.write("All discs belong to one movie release.\n");
+    const title = await prompter.ask("  Title hint (optional)");
+    const tmdbId = await prompter.askInt("  TMDB movie id (optional)");
+    const includeExtras = await prompter.askBool("  Include extras?", false);
+    process.stdout.write("\n");
+    answers.push(
+      ...movieDiscsAnswers(discs, {
+        ...(title ? { title } : {}),
+        ...(tmdbId !== null ? { tmdbId } : {}),
+        includeExtras,
+      }),
+    );
+  } else {
+    answers.push(...(await runMixedShape(discs, prompter)));
+  }
+
+  const blocks = buildBatchBlocks(answers);
+  if (blocks.length === 0) {
+    writeTomlOrError(path, emptyTemplate(), opts.force);
+    return { path, bytes: emptyTemplate().length, discCount: discs.length };
+  }
+  const contents = serializeBatchToml(blocks);
+  writeTomlOrError(path, contents, opts.force);
+  return { path, bytes: contents.length, discCount: discs.length };
+}
+
+async function runMixedShape(
+  discs: DiscDir[],
+  prompter: Prompter,
+): Promise<WizardAnswers> {
+  const groups = groupDiscs(discs);
+  const answers: WizardAnswers = [];
   for (const group of groups) {
     if (group.isTvGroup) {
       process.stdout.write(
@@ -410,14 +660,5 @@ export async function runInitBatch(opts: RunInitBatchOpts): Promise<{
     }
     process.stdout.write("\n");
   }
-
-  const blocks = buildBatchBlocks(answers);
-  if (blocks.length === 0) {
-    // Everything was skipped — still write a stub so the user has a starting point.
-    writeTomlOrError(path, emptyTemplate(), opts.force);
-    return { path, bytes: emptyTemplate().length, discCount: discs.length };
-  }
-  const contents = serializeBatchToml(blocks);
-  writeTomlOrError(path, contents, opts.force);
-  return { path, bytes: contents.length, discCount: discs.length };
+  return answers;
 }

@@ -165,23 +165,26 @@ export function persistTvIdentification(
       identified.effectiveEpisodeOrder,
       identified.season.raw,
     );
-    // Clear any title→episode links for this disc so we can DELETE+INSERT
-    // the season's episodes safely (a re-run might be re-identifying after a
-    // schema/episode-count drift).
-    db.run(`UPDATE title SET episode_id = NULL WHERE disc_id = ?`, [disc.id]);
-    db.run(`DELETE FROM episode WHERE season_id = ?`, [season.id]);
-
-    const insertEp = db.query<
+    // Upsert each episode by (season_id, episode_number) so the row IDs stay
+    // stable across re-runs and across sibling discs that share a season.
+    // A DELETE+INSERT approach would invalidate title.episode_id refs held
+    // by titles on other discs of the same season and trip the FK constraint.
+    const upsertEp = db.query<
       EpisodeRow,
       [number, number, string | null, number | null, string | null, string]
     >(
       `INSERT INTO episode (season_id, episode_number, name, runtime_min, air_date, raw_response)
        VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT (season_id, episode_number) DO UPDATE SET
+         name         = excluded.name,
+         runtime_min  = excluded.runtime_min,
+         air_date     = excluded.air_date,
+         raw_response = excluded.raw_response
        RETURNING *`,
     );
     const episodes: EpisodeRow[] = [];
     for (const ep of identified.season.episodes) {
-      const row = insertEp.get(
+      const row = upsertEp.get(
         season.id,
         ep.episode_number,
         ep.name,
@@ -189,7 +192,7 @@ export function persistTvIdentification(
         ep.air_date,
         JSON.stringify(ep.raw),
       );
-      if (!row) throw new Error(`Failed to insert episode ${ep.episode_number}`);
+      if (!row) throw new Error(`Failed to upsert episode ${ep.episode_number}`);
       episodes.push(row);
     }
 

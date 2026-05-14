@@ -131,17 +131,75 @@ describe("selectTv", () => {
     expect(sel.skipped.some((s) => s.title.makemkv_id === 0)).toBe(true);
   });
 
-  test("errors out when cohort exceeds available episodes", () => {
+  test("caps cohort to the remaining season slots and demotes the surplus to extras", () => {
+    // Three similar-duration titles but the season has only 2 episodes.
+    // The overrun used to throw; now we keep the first 2 as episodes and
+    // tag the third as an extra so the user gets the bytes for triage.
     const titles = [t(0, 2700), t(1, 2710), t(2, 2690)];
     const episodes = [ep(1), ep(2)];
-    expect(() =>
-      selectTv({
-        titles,
-        episodes,
-        minLengthSkipS: 90,
-        startingEpisode: 1,
-        includeExtras: false,
-      }),
-    ).toThrow();
+    const sel = selectTv({
+      titles,
+      episodes,
+      minLengthSkipS: 90,
+      startingEpisode: 1,
+      includeExtras: false,
+    });
+    expect(sel.episodeMap.map((m) => m.title.makemkv_id)).toEqual([0, 1]);
+    expect(sel.extras.map((t) => t.makemkv_id)).toEqual([2]);
+    expect(sel.cohortTrimmed?.detected).toBe(3);
+    expect(sel.cohortTrimmed?.seatedAsEpisode).toBe(2);
+    expect(sel.cohortTrimmed?.demoted.map((t) => t.makemkv_id)).toEqual([2]);
+  });
+
+  test("demoted titles tag along as extras even when --include-extras is off", () => {
+    // includeExtras=false would normally suppress all extras. But cohort-
+    // demoted titles are different: they came from the episode cohort, so
+    // the user almost certainly wants them remuxed for re-classification.
+    const titles = [t(0, 2700), t(1, 2710), t(2, 2690), t(3, 240)]; // t3 is short → skipped
+    const episodes = [ep(1), ep(2)];
+    const sel = selectTv({
+      titles,
+      episodes,
+      minLengthSkipS: 90,
+      startingEpisode: 1,
+      includeExtras: false,
+    });
+    expect(sel.extras.map((t) => t.makemkv_id)).toEqual([2]);
+    // The non-cohort survivor (t3) was filtered by min-length-skip, so
+    // it lands in `skipped`, NOT in extras.
+    expect(sel.skipped.some((s) => s.title.makemkv_id === 3)).toBe(true);
+  });
+
+  test("starting from mid-season caps against remaining capacity", () => {
+    // Multi-disc season scenario: disc 1 claimed E01-E13, disc 2
+    // starts at E14 with cohort=13 but only 12 slots remain (E14-E25).
+    const titles = Array.from({ length: 13 }, (_, i) => t(i, 1320));
+    const episodes = Array.from({ length: 25 }, (_, i) => ep(i + 1));
+    const sel = selectTv({
+      titles,
+      episodes,
+      minLengthSkipS: 90,
+      startingEpisode: 14,
+      includeExtras: false,
+    });
+    expect(sel.episodeMap).toHaveLength(12);
+    expect(sel.episodeMap[0]!.episode.episode_number).toBe(14);
+    expect(sel.episodeMap[11]!.episode.episode_number).toBe(25);
+    expect(sel.cohortTrimmed?.demoted).toHaveLength(1);
+  });
+
+  test("no trim when cohort fits cleanly", () => {
+    const titles = [t(0, 2700), t(1, 2710), t(2, 2690)];
+    const episodes = [ep(1), ep(2), ep(3)];
+    const sel = selectTv({
+      titles,
+      episodes,
+      minLengthSkipS: 90,
+      startingEpisode: 1,
+      includeExtras: false,
+    });
+    expect(sel.cohortTrimmed).toBeUndefined();
+    expect(sel.episodeMap).toHaveLength(3);
+    expect(sel.extras).toHaveLength(0);
   });
 });

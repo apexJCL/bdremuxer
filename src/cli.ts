@@ -4,7 +4,9 @@
 // and a `--output-format=plex|flat` option.
 
 import { Command, InvalidArgumentError, Option } from "commander";
-import { statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
 import {
@@ -12,7 +14,12 @@ import {
   resolveDiscOverrides,
   walkBdmvFolders,
 } from "./batch.ts";
-import { runInitBatch } from "./init-batch.ts";
+import {
+  patchStartingEpisodes,
+  runInitBatch,
+  targetPath as batchTomlTargetPath,
+  type StartingEpisodePatch,
+} from "./init-batch.ts";
 import { Prompter } from "./parse/prompt.ts";
 import type { CliOpts } from "./opts.ts";
 
@@ -21,6 +28,12 @@ import { runInfo } from "./makemkv/cli.ts";
 
 import { loadConfig } from "./config.ts";
 import { openDb } from "./db.ts";
+import {
+  classifyDiscOpenError,
+  normalizeBdmvDir,
+  openDiscSource,
+  type DiscSource,
+} from "./disc/index.ts";
 import type {
   DB,
   DiscRow,
@@ -45,7 +58,26 @@ import {
 } from "./pipeline/identify/tv.ts";
 import { persistMovieSelection, selectMovie } from "./pipeline/select/movie.ts";
 import type { MovieSelection } from "./pipeline/select/movie.ts";
-import { persistTvSelection, selectTv } from "./pipeline/select/tv.ts";
+import type {
+  DiscPlan,
+  DiscPlanReady,
+  MoviePlanData,
+  TvPlanData,
+} from "./pipeline/plan.ts";
+import {
+  checkStaleDone,
+  countPlans,
+  formatIssueReport,
+  formatPlanOutcomeShort,
+  formatPlanSummary,
+} from "./pipeline/plan.ts";
+import {
+  EpisodeAllocationConflictError,
+  findEpisodeAllocationConflicts,
+  highestClaimedEpisodeInSeason,
+  persistTvSelection,
+  selectTv,
+} from "./pipeline/select/tv.ts";
 import type { TvSelection } from "./pipeline/select/tv.ts";
 import { remuxMovieMain, remuxTvEpisodes } from "./pipeline/remux.ts";
 import { finalize } from "./pipeline/finalize.ts";
@@ -167,7 +199,15 @@ program
   )
   .version(PKG_VERSION, "--version", "show version and exit")
   .helpOption("-h, --help", "show this help and exit")
-  .showHelpAfterError("(run with --help for the full option list)");
+  .showHelpAfterError("(run with --help for the full option list)")
+  // Scope flags strictly to the command that defines them. Without this,
+  // when `--force` (or any other shared flag from addPipelineOptions) is
+  // typed after a subcommand name, commander attaches it to the root
+  // command instead of the subcommand because the option exists on both
+  // and the root was registered first. Result: `bdremuxer init-batch
+  // --force <dir>` silently fails to honour --force inside the
+  // subcommand action.
+  .enablePositionalOptions();
 
 addPipelineOptions(program);
 
@@ -204,6 +244,18 @@ const batchCmd = program.command("batch <parent-dir>")
   .description("walk a directory of BDMV folders and process each in sequence");
 addPipelineOptions(batchCmd);
 batchCmd.option("--continue-on-error", "keep going after a disc fails");
+batchCmd.option(
+  "--no-preflight",
+  "skip the plan-then-rip pass; process each disc end-to-end as discovered (legacy M8 behaviour)",
+);
+batchCmd.option(
+  "--plan-only",
+  "run the preflight pass, print the plan, write the plan file, and exit",
+);
+batchCmd.option(
+  "--confirm-plan",
+  "prompt 'Proceed?' after the preflight summary, before the rip phase starts",
+);
 batchCmd.addHelpText(
   "after",
   `
@@ -216,52 +268,90 @@ uses top-level keys. Both use snake_case versions of the CLI flag names
 (e.g. starting_episode = 1).`,
 );
 batchCmd.action(async function batchAction(this: Command, parentDir: string) {
-  const opts = this.opts<CliOpts & { continueOnError?: boolean }>();
+  const opts = this.opts<BatchOpts>();
   const code = await runBatch(parentDir, opts);
   process.exit(code);
 });
 
 // --- init-batch subcommand ----------------------------------------------
 
-program
+const initBatchCmd = program
   .command("init-batch <parent-dir>")
   .description(
     "scaffold a bdremuxer.batch.toml — interactive wizard by default,\n" +
       "or --empty for a commented template",
-  )
-  .option("--empty", "skip the wizard; write a commented template")
-  .option("--force", "overwrite an existing bdremuxer.batch.toml")
-  .action(
-    async function initBatchAction(
-      this: Command,
-      parentDir: string,
-      sub: { empty?: boolean; force?: boolean },
-    ) {
-      let prompter: Prompter | undefined;
-      try {
-        prompter = sub.empty ? undefined : new Prompter();
-        const res = await runInitBatch({
-          parentDir,
-          empty: !!sub.empty,
-          force: !!sub.force,
-          prompter,
-        });
-        process.stdout.write(`\nWrote ${res.path} (${res.bytes} bytes)\n`);
-        if (!sub.empty && res.discCount > 0) {
-          process.stdout.write(
-            `Reviewed ${res.discCount} disc(s).` +
-              ` Edit the file to fine-tune per-disc starting_episode values.\n`,
-          );
-        }
-        process.exit(0);
-      } catch (e) {
-        process.stderr.write(`${(e as Error).message}\n`);
-        process.exit(1);
-      } finally {
-        prompter?.close();
-      }
-    },
   );
+// Share the pipeline option surface (`--verbose`, `--json`, `--out`,
+// `--force`, …) so the preflight phase after the wizard sees the same
+// flags as `bdremuxer batch`. Without this, flags were silently dropped
+// (or rejected by commander) and the user had no way to drive verbose
+// progress or to force re-probing during init-batch's preflight pass.
+addPipelineOptions(initBatchCmd);
+initBatchCmd.option("--empty", "skip the wizard; write a commented template");
+initBatchCmd.option(
+  "--no-preflight",
+  "skip the preflight pass that normally runs after the wizard writes the TOML",
+);
+initBatchCmd.addHelpText(
+  "after",
+  `
+Note on --force:
+  On this subcommand --force has a dual meaning. It overwrites an
+  existing bdremuxer.batch.toml (the wizard otherwise refuses), AND it
+  flows into the preflight phase so cached probe rows and status='done'
+  discs get re-planned. Pass --no-preflight to skip the second half.`,
+);
+initBatchCmd.action(async function initBatchAction(this: Command, parentDir: string) {
+  const sub = this.opts<BatchOpts & { empty?: boolean }>();
+  let prompter: Prompter | undefined;
+  try {
+    prompter = sub.empty ? undefined : new Prompter();
+    const res = await runInitBatch({
+      parentDir,
+      empty: !!sub.empty,
+      force: !!sub.force,
+      prompter,
+    });
+    process.stdout.write(`\nWrote ${res.path} (${res.bytes} bytes)\n`);
+    if (!sub.empty && res.discCount > 0) {
+      process.stdout.write(
+        `Reviewed ${res.discCount} disc(s).` +
+          ` Edit the file to fine-tune per-disc starting_episode values.\n`,
+      );
+    }
+    // Close the wizard prompter before the preflight pass so stdin
+    // isn't held open through the (long-running) probe + TMDB phase.
+    prompter?.close();
+    prompter = undefined;
+
+    // Preflight after the wizard, with TOML auto-patching: every
+    // disc past the first in any season hits the
+    // EpisodeAllocationConflict guard, which now carries a structured
+    // `fix` we can write back to the TOML in place. If any patches
+    // land, we re-run preflight once to verify (one re-run only —
+    // anything still blocked is surfaced for manual inspection).
+    // Skipped for --empty (no TOML to apply yet) or --no-preflight.
+    if (!sub.empty && sub.preflight !== false) {
+      // Use the parsed CLI opts as the base; layer in the planOnly +
+      // preflight defaults that this code path requires. `as BatchOpts`
+      // is safe because addPipelineOptions populates the same fields
+      // batchCmd uses (the user just typed the same flags).
+      const baseOpts: BatchOpts = {
+        ...sub,
+        planOnly: true,
+        preflight: true,
+      } as BatchOpts;
+      const code = await runInitBatchPreflightWithAutoPatch(parentDir, baseOpts);
+      process.exit(code);
+    }
+    process.exit(0);
+  } catch (e) {
+    process.stderr.write(`${(e as Error).message}\n`);
+    process.exit(1);
+  } finally {
+    prompter?.close();
+  }
+});
 
 await program.parseAsync(process.argv);
 
@@ -270,13 +360,6 @@ await program.parseAsync(process.argv);
 // -----------------------------------------------------------------------
 
 async function runPipeline(bdmvArg: string, opts: CliOpts): Promise<number> {
-  const discRoot = normalizeDiscRoot(bdmvArg);
-  const validation = validateBdmv(discRoot);
-  if (!validation.ok) {
-    reportError(opts, validation.error);
-    return 1;
-  }
-
   let minLengthSkipS: number | null;
   try {
     minLengthSkipS = parseDurationFlag(opts.minLengthSkip);
@@ -285,7 +368,16 @@ async function runPipeline(bdmvArg: string, opts: CliOpts): Promise<number> {
     return 2;
   }
 
-  const cfg = loadConfig({ outDir: opts.out, dbPath: opts.db });
+  // Default the output dir to a sibling of the input disc — i.e., the
+  // parent of the BDMV folder — when the user hasn't pinned one via flag
+  // or env. Keeps output co-located with the source library by default.
+  // Computed before opening the DiscSource so the ISO backend's mount
+  // root can land under <out>/.bdremuxer/mounts (specs/spec-iso.md §4.1).
+  const cfg = loadConfig({
+    outDir: opts.out,
+    dbPath: opts.db,
+    defaultOutDir: defaultLibraryDir(bdmvArg),
+  });
   if (!cfg.tmdbApiKey) {
     reportError(opts, "BDREMUXER_TMDB_API_KEY is required for identification.");
     return 1;
@@ -304,6 +396,20 @@ async function runPipeline(bdmvArg: string, opts: CliOpts): Promise<number> {
   };
   log(`bdremuxer v${PKG_VERSION}`);
   log(`makemkvcon: ${makemkvcon}`);
+
+  let source: DiscSource;
+  try {
+    source = await openDiscSource(bdmvArg, {
+      mountRoot: join(tmpdir(), "bdremuxer-mounts"),
+      log,
+      emitEvent: opts.json ? emitJson : undefined,
+    });
+  } catch (e) {
+    reportError(opts, formatDiscOpenError(e));
+    return 1;
+  }
+
+  const discRoot = source.bdmvPath;
   log(`disc root:  ${discRoot}`);
   log(`out:        ${cfg.outDir}`);
   log(`db:         ${cfg.dbPath}`);
@@ -314,7 +420,7 @@ async function runPipeline(bdmvArg: string, opts: CliOpts): Promise<number> {
   try {
     // §5.1 Scan
     log("scan...");
-    const scanRes = await scan(db, discRoot);
+    const scanRes = await scan(db, source);
     const shortFp = scanRes.fingerprint.slice(0, 12);
     log(`fingerprint: ${shortFp}…`);
 
@@ -363,7 +469,7 @@ async function runPipeline(bdmvArg: string, opts: CliOpts): Promise<number> {
     }
 
     // §5.3 Classify
-    const parentDirName = basename(dirname(discRoot));
+    const parentDirName = basename(dirname(source.originalPath));
     let kind: "movie" | "tv";
     try {
       kind = classify({
@@ -393,6 +499,7 @@ async function runPipeline(bdmvArg: string, opts: CliOpts): Promise<number> {
         scanRes,
         parentDirName,
         makemkvcon,
+        source,
         discRoot,
         shortFp,
         minLengthSkipS,
@@ -408,6 +515,7 @@ async function runPipeline(bdmvArg: string, opts: CliOpts): Promise<number> {
       scanRes,
       parentDirName,
       makemkvcon,
+      source,
       discRoot,
       shortFp,
       minLengthSkipS,
@@ -418,6 +526,9 @@ async function runPipeline(bdmvArg: string, opts: CliOpts): Promise<number> {
     return 1;
   } finally {
     db.close();
+    try {
+      await source.close();
+    } catch {}
   }
 }
 
@@ -434,10 +545,99 @@ function reportError(
 // Batch orchestrator
 // -----------------------------------------------------------------------
 
-async function runBatch(
+type BatchOpts = CliOpts & {
+  continueOnError?: boolean;
+  preflight?: boolean; // commander negates --no-preflight to preflight=false
+  planOnly?: boolean;
+  confirmPlan?: boolean;
+};
+
+// init-batch flavour of preflight: same phase-1 pass `batch` would run,
+// but after it lands we collect any structured `fix` values from blocked
+// discs (today: starting_episode suggestions from the
+// EpisodeAllocationConflict guard) and patch them into the just-written
+// bdremuxer.batch.toml. One re-run validates the patch; anything still
+// blocked after that is surfaced to the user verbatim.
+async function runInitBatchPreflightWithAutoPatch(
   parentDir: string,
-  opts: CliOpts & { continueOnError?: boolean },
+  baseOpts: BatchOpts,
 ): Promise<number> {
+  let parentAbs: string;
+  try {
+    parentAbs = resolve(parentDir);
+    const st = statSync(parentAbs);
+    if (!st.isDirectory()) {
+      reportError(baseOpts, `Not a directory: ${parentAbs}`);
+      return 1;
+    }
+  } catch {
+    reportError(baseOpts, `Path does not exist: ${parentDir}`);
+    return 1;
+  }
+
+  const discs = walkBdmvFolders(parentAbs);
+  if (discs.length === 0) {
+    reportError(baseOpts, `No BDMV folders found under ${parentAbs}`);
+    return 1;
+  }
+
+  // First pass.
+  const batchBlocks1 = loadBatchOverrides(parentAbs);
+  const opts1: BatchOpts = {
+    ...baseOpts,
+    out: baseOpts.out ?? process.env["BDREMUXER_OUTPUT_DIR"] ?? parentAbs,
+  };
+  process.stdout.write(`\n[bdremuxer] running preflight pass…\n`);
+  if (opts1.force) {
+    // Visible acknowledgement so the user knows the flag was honoured —
+    // its observable effect during planning (skipping the already-done
+    // shortcut + ignoring cached probe rows) only matters on re-runs
+    // and is otherwise invisible.
+    process.stdout.write(
+      `[bdremuxer] --force enabled: re-probing cached titles and re-planning status='done' discs\n`,
+    );
+  }
+  const first = await runPreflightPass(parentAbs, discs, batchBlocks1, opts1);
+
+  // Gather every blocked disc that carries a structured fix.
+  const patches: StartingEpisodePatch[] = [];
+  for (const p of first.plans) {
+    if (p.kind === "blocked" && p.fix?.kind === "set-starting-episode") {
+      patches.push({ relPath: p.relPath, startingEpisode: p.fix.value });
+    }
+  }
+  if (patches.length === 0) {
+    // Nothing actionable — exit honestly.
+    return first.counts.blocked > 0 || first.counts.staleDone > 0 ? 1 : 0;
+  }
+
+  const tomlPath = batchTomlTargetPath(parentAbs);
+  const result = patchStartingEpisodes(tomlPath, patches);
+  process.stdout.write(
+    `\n[bdremuxer] auto-patched ${result.patched.length} starting_episode value(s) in ${tomlPath}:\n`,
+  );
+  for (const p of patches) {
+    const ok = result.patched.includes(p.relPath);
+    process.stdout.write(
+      `  ${ok ? "✓" : "·"} ${p.relPath} → starting_episode = ${p.startingEpisode}` +
+        (ok ? "" : "  (block not found / no starting_episode key)") +
+        "\n",
+    );
+  }
+  if (result.patched.length === 0) {
+    // Nothing actually landed; don't bother re-running.
+    return 1;
+  }
+
+  // Re-run preflight against the patched TOML so the user sees a clean
+  // summary (or a smaller, more specific issue list).
+  process.stdout.write(`\n[bdremuxer] re-running preflight to verify the patches…\n`);
+  const batchBlocks2 = loadBatchOverrides(parentAbs);
+  const second = await runPreflightPass(parentAbs, discs, batchBlocks2, opts1);
+  return second.counts.blocked > 0 || second.counts.staleDone > 0 ? 1 : 0;
+}
+
+async function runBatch(parentDir: string, opts: BatchOpts): Promise<number> {
   let parentAbs: string;
   try {
     parentAbs = resolve(parentDir);
@@ -458,46 +658,65 @@ async function runBatch(
   }
 
   const batchBlocks = loadBatchOverrides(parentAbs);
+  const batchDefaultedOpts: BatchOpts = {
+    ...opts,
+    out: opts.out ?? process.env["BDREMUXER_OUTPUT_DIR"] ?? parentAbs,
+  };
+
   if (opts.json) {
     emitJson("batch_start", {
       parent_dir: parentAbs,
       disc_count: discs.length,
       batch_toml_blocks: batchBlocks.length,
+      out_dir: batchDefaultedOpts.out,
+      preflight: opts.preflight !== false,
     });
   } else if (opts.verbose) {
     process.stderr.write(
       `[bdremuxer] batch: ${discs.length} discs under ${parentAbs}\n` +
+        `[bdremuxer] batch out:  ${batchDefaultedOpts.out}\n` +
         (batchBlocks.length > 0
           ? `[bdremuxer] batch.toml: ${batchBlocks.length} glob block(s) loaded\n`
           : ""),
     );
   }
 
+  // commander treats --no-preflight as preflight=false; default is undefined
+  // → treated as true.
+  const preflightEnabled = opts.preflight !== false;
+  if (!preflightEnabled) {
+    return await runBatchLegacy(parentAbs, discs, batchBlocks, batchDefaultedOpts);
+  }
+  return await runBatchWithPreflight(parentAbs, discs, batchBlocks, batchDefaultedOpts);
+}
+
+// Legacy M8 flow: per-disc plan+execute end-to-end as we walk. Used when
+// the user passes --no-preflight.
+async function runBatchLegacy(
+  parentAbs: string,
+  discs: ReturnType<typeof walkBdmvFolders>,
+  batchBlocks: ReturnType<typeof loadBatchOverrides>,
+  batchDefaultedOpts: BatchOpts,
+): Promise<number> {
   const results: Array<{ relPath: string; code: number }> = [];
   for (let i = 0; i < discs.length; i++) {
     const disc = discs[i]!;
     const effectiveOpts = resolveDiscOverrides({
-      cliOpts: opts,
+      cliOpts: batchDefaultedOpts,
       discRelPath: disc.relPath,
       discAbsPath: disc.absPath,
       batchBlocks,
     });
 
-    if (opts.json) {
-      emitJson("batch_disc_start", {
-        idx: i + 1,
-        total: discs.length,
-        rel_path: disc.relPath,
-      });
+    if (batchDefaultedOpts.json) {
+      emitJson("batch_disc_start", { idx: i + 1, total: discs.length, rel_path: disc.relPath });
     } else {
-      process.stderr.write(
-        `\n=== Disc ${i + 1}/${discs.length}: ${disc.relPath} ===\n`,
-      );
+      process.stderr.write(`\n=== Disc ${i + 1}/${discs.length}: ${disc.relPath} ===\n`);
     }
     const code = await runPipeline(disc.absPath, effectiveOpts);
     results.push({ relPath: disc.relPath, code });
-    if (code !== 0 && !opts.continueOnError) {
-      if (!opts.json) {
+    if (code !== 0 && !batchDefaultedOpts.continueOnError) {
+      if (!batchDefaultedOpts.json) {
         process.stderr.write(
           `\nDisc failed (exit ${code}); stopping. Pass --continue-on-error to keep going.\n`,
         );
@@ -505,7 +724,187 @@ async function runBatch(
       break;
     }
   }
+  return finalizeBatchResults(results, batchDefaultedOpts);
+}
 
+// Two-phase flow: plan every disc first, surface every issue at once, then
+// rip the ready discs in walk order. See spec-preflight.md.
+// Phase 1 only: walk every disc, plan it, print the summary, write the
+// plan file. Used by both the batch flow (which then proceeds to phase 2)
+// and the init-batch handler (which uses the plans to auto-patch the
+// freshly-written TOML before re-running this same pass to verify).
+export async function runPreflightPass(
+  parentAbs: string,
+  discs: ReturnType<typeof walkBdmvFolders>,
+  batchBlocks: ReturnType<typeof loadBatchOverrides>,
+  batchDefaultedOpts: BatchOpts,
+): Promise<{
+  plans: DiscPlan[];
+  counts: ReturnType<typeof countPlans>;
+  perDiscOpts: CliOpts[];
+}> {
+  const perDiscOpts = discs.map((d) =>
+    resolveDiscOverrides({
+      cliOpts: batchDefaultedOpts,
+      discRelPath: d.relPath,
+      discAbsPath: d.absPath,
+      batchBlocks,
+    }),
+  );
+
+  if (!batchDefaultedOpts.json) {
+    process.stderr.write(`\n[plan] Walking ${discs.length} disc(s)…\n`);
+  } else {
+    emitJson("preflight_start", { parent_dir: parentAbs, total_discs: discs.length });
+  }
+  // Render the live per-disc line only when the user is reading text on
+  // stdout/stderr — under --json the structured preflight_disc_planned
+  // events already cover it, and the rewriting cursor would corrupt the
+  // NDJSON stream of any consumer that's also reading stderr.
+  const useProgress = !batchDefaultedOpts.json;
+  const plans: DiscPlan[] = [];
+  for (let i = 0; i < discs.length; i++) {
+    const d = discs[i]!;
+    const dOpts = perDiscOpts[i]!;
+    const progress = useProgress
+      ? startDiscProgress({
+          idx: i + 1,
+          total: discs.length,
+          relPath: d.relPath,
+          out: process.stderr,
+        })
+      : undefined;
+    let plan: DiscPlan;
+    try {
+      plan = await planSingleDisc(d.absPath, dOpts, d.relPath, progress);
+    } catch (e) {
+      progress?.done(`⚠ unexpected error: ${(e as Error).message.slice(0, 80)}`);
+      throw e;
+    }
+    progress?.done(formatPlanOutcomeShort(plan));
+    plans.push(plan);
+    if (batchDefaultedOpts.json) {
+      emitJson("preflight_disc_planned", {
+        idx: i + 1,
+        total: discs.length,
+        rel_path: d.relPath,
+        status: plan.kind,
+        ...(plan.kind === "blocked"
+          ? { stage: plan.stage, reason: plan.reason, suggestion: plan.suggestion ?? null }
+          : {}),
+        ...(plan.kind === "stale-done" ? { missing: plan.missingOutputs } : {}),
+      });
+    }
+  }
+
+  const counts = countPlans(plans);
+  if (!batchDefaultedOpts.json) {
+    process.stdout.write(formatPlanSummary(plans, parentAbs));
+    const issues = formatIssueReport(plans);
+    if (issues) process.stdout.write(issues);
+  } else {
+    emitJson("preflight_summary", {
+      ready: counts.ready,
+      blocked: counts.blocked,
+      already_done: counts.alreadyDone,
+      stale_done: counts.staleDone,
+      total: counts.total,
+    });
+  }
+
+  try {
+    const planPath = writeBatchPlanFile(plans, parentAbs, batchDefaultedOpts.out ?? parentAbs);
+    if (batchDefaultedOpts.verbose && !batchDefaultedOpts.json) {
+      process.stderr.write(`[bdremuxer] plan file: ${planPath}\n`);
+    }
+  } catch (e) {
+    if (batchDefaultedOpts.verbose) {
+      process.stderr.write(`[bdremuxer] warning: failed to write plan file: ${(e as Error).message}\n`);
+    }
+  }
+
+  return { plans, counts, perDiscOpts };
+}
+
+async function runBatchWithPreflight(
+  parentAbs: string,
+  discs: ReturnType<typeof walkBdmvFolders>,
+  batchBlocks: ReturnType<typeof loadBatchOverrides>,
+  batchDefaultedOpts: BatchOpts,
+): Promise<number> {
+  const { plans, counts, perDiscOpts } = await runPreflightPass(
+    parentAbs,
+    discs,
+    batchBlocks,
+    batchDefaultedOpts,
+  );
+
+  if (batchDefaultedOpts.planOnly) {
+    // Non-zero only if something needs attention.
+    return counts.blocked > 0 || counts.staleDone > 0 ? 1 : 0;
+  }
+
+  if (batchDefaultedOpts.confirmPlan && counts.ready > 0) {
+    const prompter = new Prompter();
+    try {
+      const proceed = await prompter.askBool(
+        `\nProceed with ripping ${counts.ready} disc(s)?`,
+        true,
+      );
+      if (!proceed) {
+        process.stderr.write("Aborted before rip phase. The plan file is on disk.\n");
+        return 0;
+      }
+    } finally {
+      prompter.close();
+    }
+  }
+
+  if (counts.ready === 0) {
+    // Nothing to do in phase 2. Exit non-zero if there's anything to fix.
+    return counts.blocked > 0 || counts.staleDone > 0 ? 1 : 0;
+  }
+
+  // Phase 2: execute the ready plans.
+  const results: Array<{ relPath: string; code: number }> = [];
+  let readyIdx = 0;
+  const readyTotal = counts.ready;
+  for (let i = 0; i < plans.length; i++) {
+    const plan = plans[i]!;
+    if (plan.kind !== "ready") continue;
+    readyIdx++;
+    const dOpts = perDiscOpts[i]!;
+    if (batchDefaultedOpts.json) {
+      emitJson("batch_disc_start", {
+        idx: readyIdx,
+        total: readyTotal,
+        rel_path: plan.relPath,
+      });
+    } else {
+      process.stderr.write(
+        `\n=== Rip ${readyIdx}/${readyTotal}: ${plan.relPath} ===\n`,
+      );
+    }
+    const code = await executePlannedDisc(plan, dOpts);
+    results.push({ relPath: plan.relPath, code });
+    if (code !== 0 && !batchDefaultedOpts.continueOnError) {
+      if (!batchDefaultedOpts.json) {
+        process.stderr.write(
+          `\nDisc failed (exit ${code}); stopping. Pass --continue-on-error to keep going.\n`,
+        );
+      }
+      break;
+    }
+  }
+  const code = finalizeBatchResults(results, batchDefaultedOpts);
+  // Surface the planning issues in the final exit code too.
+  return code !== 0 || counts.blocked > 0 || counts.staleDone > 0 ? 1 : 0;
+}
+
+function finalizeBatchResults(
+  results: Array<{ relPath: string; code: number }>,
+  opts: BatchOpts,
+): number {
   const ok = results.filter((r) => r.code === 0).length;
   const failed = results.filter((r) => r.code !== 0);
   if (opts.json) {
@@ -525,6 +924,77 @@ async function runBatch(
   return failed.length > 0 ? 1 : 0;
 }
 
+// Best-effort plan file. Informational only (the DB is source of truth for
+// resume). One file per batch, keyed by a short hash of (parent_dir + disc
+// rel paths) so re-runs overwrite the same file.
+function writeBatchPlanFile(plans: DiscPlan[], parentDir: string, outDir: string): string {
+  const fp = createHash("sha256")
+    .update(parentDir + "\n")
+    .update(plans.map((p) => p.relPath).join("\n"))
+    .digest("hex")
+    .slice(0, 12);
+  const dir = join(outDir, ".bdremuxer", "plans");
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `${fp}.json`);
+  const payload = {
+    schema_version: 1,
+    generated_at: new Date().toISOString(),
+    bdremuxer_version: PKG_VERSION,
+    parent_dir: parentDir,
+    out_dir: outDir,
+    plans: plans.map(serializePlan),
+  };
+  writeFileSync(path, JSON.stringify(payload, null, 2));
+  return path;
+}
+
+function serializePlan(p: DiscPlan): Record<string, unknown> {
+  const base = { rel_path: p.relPath, abs_path: p.absPath, status: p.kind };
+  switch (p.kind) {
+    case "ready": {
+      if (p.media.kind === "movie") {
+        return {
+          ...base,
+          short_fp: p.shortFp,
+          media: {
+            kind: "movie",
+            tmdb_id: p.media.movie.tmdb_id,
+            imdb_id: p.media.movie.imdb_id,
+            title: p.media.movie.title,
+            year: p.media.movie.year,
+            extras: p.media.selection.extras.length,
+            identify_source: p.media.identifySource,
+          },
+        };
+      }
+      return {
+        ...base,
+        short_fp: p.shortFp,
+        media: {
+          kind: "tv",
+          tmdb_show_id: p.media.show.tmdb_id,
+          name: p.media.show.name,
+          season_number: p.media.season.season_number,
+          episode_count: p.media.selection.episodeMap.length,
+          first_episode_number: p.media.selection.episodeMap[0]?.episode.episode_number ?? null,
+          last_episode_number:
+            p.media.selection.episodeMap[p.media.selection.episodeMap.length - 1]?.episode
+              .episode_number ?? null,
+          extras: p.media.selection.extras.length,
+          identify_source: p.media.identifySource,
+          season_source: p.media.seasonSource,
+        },
+      };
+    }
+    case "blocked":
+      return { ...base, stage: p.stage, reason: p.reason, suggestion: p.suggestion ?? null };
+    case "already-done":
+      return { ...base, output_path: p.outputPath };
+    case "stale-done":
+      return { ...base, missing_outputs: p.missingOutputs };
+  }
+}
+
 type StageCtx = {
   db: DB;
   disc: DiscRow;
@@ -534,14 +1004,492 @@ type StageCtx = {
   scanRes: Awaited<ReturnType<typeof scan>>;
   parentDirName: string;
   makemkvcon: string;
+  /** Held by the orchestrator for the lifetime of the pipeline. */
+  source: DiscSource;
+  /**
+   * Equals `source.bdmvPath` — the path passed to `makemkvcon file:…`
+   * and used wherever pipeline code needs to read disc bytes. Kept as
+   * a separate field so the inner stages don't need to dereference
+   * `source` on every read.
+   */
   discRoot: string;
   shortFp: string;
   minLengthSkipS: number | null;
   log: (msg: string) => void;
 };
 
-async function runMoviePipeline(ctx: StageCtx): Promise<number> {
-  const { db, opts, log, cfg, makemkvcon, discRoot, shortFp, titleRows, scanRes, parentDirName, minLengthSkipS } = ctx;
+// -------- Per-disc planning (phase 1 of preflight) -----------------------
+//
+// Run scan/probe/classify/identify/select for one disc, persist everything
+// that's safe to persist, and return a DiscPlan describing the outcome.
+// Owns its own DB connection. Used by both the preflight pass and the
+// single-disc invocation flow below.
+
+// A progress sink the preflight loop uses to render a live per-disc
+// status line. planSingleDisc just calls `setStage(name)` at each stage
+// boundary; the renderer (see `startDiscProgress` below) decides whether
+// to rewrite in place on a TTY, print line-per-stage on a non-TTY, or
+// stay silent under --json.
+//
+// `log(msg)` is the verbose-mode escape hatch: it lets planSingleDisc
+// emit a diagnostic line that sits *above* the live status line without
+// corrupting the in-place cursor. The TTY renderer clears the live
+// line, writes the log message + newline, then redraws the live line
+// underneath. Without this, `--verbose` would be silently disabled
+// whenever a progress sink is active.
+type PlanProgressSink = {
+  setStage: (stage: string) => void;
+  log: (msg: string) => void;
+};
+
+// Builds a PlanProgressSink that renders one line per disc:
+//
+//   TTY mode: `  [3/6] DISC.iso · probing… 47s` rewritten in place,
+//     elapsed-time ticker refreshes every second so a stalled stage is
+//     visibly stalled. `done()` rewrites the line one last time with
+//     the final outcome and emits a newline so the next disc starts
+//     fresh.
+//   Non-TTY mode: one line per stage transition (linear log), same
+//     content. Used in CI / piped output where `\r` is meaningless.
+//
+// Time is per-stage, not per-disc: when the user sees `identifying…
+// 60s` they know TMDB has been hanging for a minute, not that the disc
+// has taken a minute total. That's the actionable signal for "stuck".
+function startDiscProgress(opts: {
+  idx: number;
+  total: number;
+  relPath: string;
+  out: NodeJS.WriteStream;
+}): PlanProgressSink & { done: (outcome: string) => void } {
+  const { idx, total, relPath, out } = opts;
+  const isTty = !!out.isTTY;
+  let stage = "preparing";
+  let stageStart = Date.now();
+
+  const live = () => {
+    const elapsed = Math.round((Date.now() - stageStart) / 1000);
+    if (isTty) {
+      // \r returns to column 0; \x1b[2K clears the whole line.
+      // Clamp to terminal width so a long relPath doesn't wrap — once
+      // the line wraps, \r returns to the start of the LAST wrapped
+      // row, and the next tick's \x1b[2K only clears that row, leaving
+      // upper wrap rows on screen as ghost text.
+      const raw = `  [${idx}/${total}] ${relPath} · ${stage}… ${elapsed}s`;
+      const cols = out.columns ?? 0;
+      const line =
+        cols > 4 && raw.length >= cols ? `${raw.slice(0, cols - 2)}…` : raw;
+      out.write(`\r\x1b[2K${line}`);
+    }
+  };
+
+  const interval = isTty ? setInterval(live, 1000) : null;
+  live();
+
+  return {
+    setStage(next: string) {
+      const elapsed = Math.round((Date.now() - stageStart) / 1000);
+      if (!isTty) {
+        out.write(`  [${idx}/${total}] ${relPath} · ${stage} → ${next} (${elapsed}s in ${stage})\n`);
+      }
+      stage = next;
+      stageStart = Date.now();
+      live();
+    },
+    log(msg: string) {
+      // TTY: clear the live line, push the diagnostic out with its own
+      // newline so it stays on screen, then redraw the live line below
+      // it. Without this, --verbose either stomps over the cursor or
+      // (today's bug) gets suppressed entirely. Non-TTY: plain stderr.
+      if (isTty) {
+        out.write(`\r\x1b[2K${msg}\n`);
+        live();
+      } else {
+        out.write(`${msg}\n`);
+      }
+    },
+    done(outcome: string) {
+      if (interval) clearInterval(interval);
+      if (isTty) {
+        out.write(`\r\x1b[2K  [${idx}/${total}] ${relPath} · ${outcome}\n`);
+      } else {
+        const elapsed = Math.round((Date.now() - stageStart) / 1000);
+        out.write(`  [${idx}/${total}] ${relPath} · ${outcome} (${elapsed}s in ${stage})\n`);
+      }
+    },
+  };
+}
+
+// The batch walker reports relPath as the path under the parent dir
+// (e.g. "SHOW_S1_HDBEE/S1 D1"). When called from the single-disc
+// flow we don't have that context, so fall back to basename(absPath).
+async function planSingleDisc(
+  absPath: string,
+  opts: CliOpts,
+  relPathOverride?: string,
+  progress?: PlanProgressSink,
+): Promise<DiscPlan> {
+  const relPath = relPathOverride ?? basename(absPath);
+
+  let minLengthSkipS: number | null;
+  try {
+    minLengthSkipS = parseDurationFlag(opts.minLengthSkip);
+  } catch (e) {
+    return {
+      kind: "blocked",
+      relPath,
+      absPath,
+      stage: "scan",
+      reason: (e as Error).message,
+    };
+  }
+
+  const cfg = loadConfig({
+    outDir: opts.out,
+    dbPath: opts.db,
+    defaultOutDir: defaultLibraryDir(absPath),
+  });
+  if (!cfg.tmdbApiKey) {
+    return {
+      kind: "blocked",
+      relPath,
+      absPath,
+      stage: "scan",
+      reason: "BDREMUXER_TMDB_API_KEY is required for identification.",
+    };
+  }
+
+  let makemkvcon: string;
+  try {
+    makemkvcon = discoverMakemkvcon({ override: opts.makemkvcon });
+  } catch (e) {
+    return {
+      kind: "blocked",
+      relPath,
+      absPath,
+      stage: "scan",
+      reason: (e as Error).message,
+    };
+  }
+
+  const log = (msg: string) => {
+    if (!opts.verbose) return;
+    // When a progress sink is active, route verbose lines through it so
+    // they sit above the live line instead of stomping the cursor.
+    if (progress) progress.log(`[bdremuxer] [plan] ${relPath}: ${msg}`);
+    else process.stderr.write(`[bdremuxer] [plan] ${relPath}: ${msg}\n`);
+  };
+
+  progress?.setStage(/\.iso$/i.test(absPath) ? "mounting" : "opening");
+  let source: DiscSource;
+  try {
+    source = await openDiscSource(absPath, {
+      mountRoot: join(tmpdir(), "bdremuxer-mounts"),
+      log,
+      emitEvent: opts.json ? emitJson : undefined,
+    });
+  } catch (e) {
+    const { code, suggestion } = classifyDiscOpenError(e);
+    return {
+      kind: "blocked",
+      relPath,
+      absPath,
+      stage: "scan",
+      reason: (e as Error).message,
+      ...(code !== undefined ? { code } : {}),
+      ...(suggestion !== undefined ? { suggestion } : {}),
+    };
+  }
+  const discRoot = source.bdmvPath;
+
+  const db = openDb(cfg.dbPath);
+  try {
+    progress?.setStage("scanning");
+    const scanRes = await scan(db, source);
+    const shortFp = scanRes.fingerprint.slice(0, 12);
+
+    // Already-done bookkeeping. Distinguishes:
+    //   already-done — every expected MKV still on disk; phase 2 will skip.
+    //   stale-done   — status='done' but outputs missing; needs --force.
+    if (!opts.force && scanRes.disc.status === "done") {
+      const stale = checkStaleDone(db, scanRes.disc.id);
+      if (!stale.ok) {
+        return { kind: "stale-done", relPath, absPath, disc: scanRes.disc, missingOutputs: stale.missing };
+      }
+      const mainOut = db
+        .query<{ output_path: string | null }, [number]>(
+          `SELECT output_path FROM title WHERE disc_id = ? AND role = 'main'`,
+        )
+        .get(scanRes.disc.id);
+      return {
+        kind: "already-done",
+        relPath,
+        absPath,
+        disc: scanRes.disc,
+        outputPath: mainOut?.output_path ?? null,
+      };
+    }
+
+    // Probe — skipped when titles are cached.
+    progress?.setStage("probing");
+    let titleRows: TitleRow[];
+    const cachedTitles = db
+      .query<TitleRow, [number]>(
+        `SELECT * FROM title WHERE disc_id = ? ORDER BY makemkv_id`,
+      )
+      .all(scanRes.disc.id);
+    if (cachedTitles.length > 0 && !opts.force) {
+      titleRows = cachedTitles;
+      log(`probe: reusing ${titleRows.length} cached titles`);
+    } else {
+      log("probe...");
+      try {
+        const { probe } = await runInfo({
+          makemkvcon,
+          source: `file:${discRoot}`,
+          echoStderr: !!opts.verbose,
+        });
+        titleRows = persistProbe(db, scanRes.disc.id, probe);
+      } catch (e) {
+        return {
+          kind: "blocked",
+          relPath,
+          absPath,
+          stage: "probe",
+          reason: (e as Error).message,
+        };
+      }
+      log(`probe: ${titleRows.length} titles persisted`);
+    }
+
+    // Classify.
+    progress?.setStage("classifying");
+    const parentDirName = basename(dirname(source.originalPath));
+    const typeFlag = opts.type === "auto" ? undefined : opts.type;
+    let kind: "movie" | "tv";
+    try {
+      kind = classify({
+        titles: titleRows,
+        volumeLabel: scanRes.volumeLabel || null,
+        parentDirName,
+        minLengthSkipS,
+        typeFlag,
+      });
+    } catch (e) {
+      if (e instanceof ClassifyError) {
+        return {
+          kind: "blocked",
+          relPath,
+          absPath,
+          stage: "classify",
+          reason: e.message,
+          suggestion: "Pass --type movie or --type tv (or type = '...' in batch.toml).",
+        };
+      }
+      throw e;
+    }
+    const discClassified = persistMediaKind(db, scanRes.disc, kind);
+    log(`classified: ${kind}`);
+
+    const ctx: StageCtx = {
+      db,
+      disc: discClassified,
+      titleRows,
+      cfg,
+      opts,
+      scanRes,
+      parentDirName,
+      makemkvcon,
+      source,
+      discRoot,
+      shortFp,
+      minLengthSkipS,
+      log,
+    };
+
+    progress?.setStage("identifying");
+    if (kind === "tv") {
+      const planResult = await planTv(ctx);
+      if ("blocked" in planResult) {
+        return {
+          kind: "blocked",
+          relPath,
+          absPath,
+          stage: planResult.stage,
+          reason: planResult.reason,
+          ...(planResult.suggestion !== undefined ? { suggestion: planResult.suggestion } : {}),
+          ...(planResult.fix !== undefined ? { fix: planResult.fix } : {}),
+        };
+      }
+      return {
+        kind: "ready",
+        relPath,
+        absPath,
+        shortFp,
+        fingerprint: scanRes.fingerprint,
+        volumeLabel: scanRes.volumeLabel || null,
+        disc: planResult.persisted.disc,
+        titleRows: db
+          .query<TitleRow, [number]>(`SELECT * FROM title WHERE disc_id = ? ORDER BY makemkv_id`)
+          .all(planResult.persisted.disc.id),
+        media: planResult.data,
+      };
+    }
+    // Movie path
+    const planResult = await planMovie(ctx);
+    if ("blocked" in planResult) {
+      return {
+        kind: "blocked",
+        relPath,
+        absPath,
+        stage: planResult.stage,
+        reason: planResult.reason,
+        ...(planResult.suggestion !== undefined ? { suggestion: planResult.suggestion } : {}),
+      };
+    }
+    return {
+      kind: "ready",
+      relPath,
+      absPath,
+      shortFp,
+      fingerprint: scanRes.fingerprint,
+      volumeLabel: scanRes.volumeLabel || null,
+      disc: planResult.discIdentified,
+      titleRows: db
+        .query<TitleRow, [number]>(`SELECT * FROM title WHERE disc_id = ? ORDER BY makemkv_id`)
+        .all(planResult.discIdentified.id),
+      media: planResult.data,
+    };
+  } catch (e) {
+    return {
+      kind: "blocked",
+      relPath,
+      absPath,
+      stage: "scan",
+      reason: (e as Error).message,
+    };
+  } finally {
+    db.close();
+    try {
+      await source.close();
+    } catch {}
+  }
+}
+
+// -------- Per-disc execution (phase 2 of preflight) ----------------------
+//
+// Take a ready plan and run remux + finalize. Owns its own DB connection.
+// Reconstructs StageCtx from the plan (everything the executors need is
+// either on the plan or recomputable from opts).
+
+async function executePlannedDisc(
+  plan: DiscPlanReady,
+  opts: CliOpts,
+): Promise<number> {
+  const cfg = loadConfig({
+    outDir: opts.out,
+    dbPath: opts.db,
+    defaultOutDir: defaultLibraryDir(plan.absPath),
+  });
+  let makemkvcon: string;
+  try {
+    makemkvcon = discoverMakemkvcon({ override: opts.makemkvcon });
+  } catch (e) {
+    reportError(opts, (e as Error).message);
+    return 1;
+  }
+  const log = (msg: string) => {
+    if (opts.verbose) process.stderr.write(`[bdremuxer] [exec] ${plan.relPath}: ${msg}\n`);
+  };
+
+  let minLengthSkipS: number | null;
+  try {
+    minLengthSkipS = parseDurationFlag(opts.minLengthSkip);
+  } catch (e) {
+    reportError(opts, (e as Error).message);
+    return 2;
+  }
+
+  let source: DiscSource;
+  try {
+    source = await openDiscSource(plan.absPath, {
+      mountRoot: join(tmpdir(), "bdremuxer-mounts"),
+      log,
+      emitEvent: opts.json ? emitJson : undefined,
+    });
+  } catch (e) {
+    reportError(opts, formatDiscOpenError(e));
+    return 1;
+  }
+  const discRoot = source.bdmvPath;
+
+  const db = openDb(cfg.dbPath);
+  try {
+    const ctx: StageCtx = {
+      db,
+      disc: plan.disc,
+      titleRows: plan.titleRows,
+      cfg,
+      opts,
+      scanRes: {
+        fingerprint: plan.fingerprint,
+        volumeLabel: plan.volumeLabel ?? "",
+        disc: plan.disc,
+      },
+      parentDirName: basename(dirname(source.originalPath)),
+      makemkvcon,
+      source,
+      discRoot,
+      shortFp: plan.shortFp,
+      minLengthSkipS,
+      log,
+    };
+    if (plan.media.kind === "movie") {
+      return await executeMoviePlan(ctx, plan.media, plan.disc);
+    }
+    // Build a PersistedTv-shaped object from the plan data for executeTvPlan.
+    return await executeTvPlan(
+      ctx,
+      plan.media,
+      {
+        disc: plan.disc,
+        show: plan.media.show,
+        season: plan.media.season,
+        episodes: plan.media.episodes,
+      },
+    );
+  } catch (e) {
+    reportError(opts, (e as Error).message);
+    return 1;
+  } finally {
+    db.close();
+    try {
+      await source.close();
+    } catch {}
+  }
+}
+
+// -------- Movie pipeline: split into plan + execute halves --------------
+//
+// planMovie: identify (TMDB / OMDb fallback) → persist movie → select →
+// persist selection. Returns the planning data or a Blocked record so the
+// preflight pass can aggregate issues instead of aborting at the first one.
+// All DB writes are idempotent re-runs are safe.
+//
+// executeMoviePlan: remux + finalize, using the data planMovie produced.
+// The disc passed in is the post-identify row (movie_id set).
+
+type BlockedReason = {
+  blocked: true;
+  stage: "identify" | "select";
+  reason: string;
+  suggestion?: string;
+  fix?: import("./pipeline/plan.ts").DiscPlanFix;
+};
+
+async function planMovie(
+  ctx: StageCtx,
+): Promise<{ data: MoviePlanData; discIdentified: DiscRow } | BlockedReason> {
+  const { db, opts, log, cfg, titleRows, scanRes, parentDirName, minLengthSkipS } = ctx;
 
   log("identify (TMDB)...");
   const client = new TmdbClient({ apiKey: cfg.tmdbApiKey! });
@@ -561,28 +1509,18 @@ async function runMoviePipeline(ctx: StageCtx): Promise<number> {
     });
   } catch (e) {
     if (e instanceof AmbiguousMatchError) {
-      if (opts.json) {
-        emitJson("ambiguous_match", {
-          kind: "movie",
-          candidates: e.candidates.map((c) => ({
-            tmdb_id: c.id,
-            title: c.title,
-            year: c.release_date?.slice(0, 4) ?? null,
-            popularity: c.popularity,
-          })),
-        });
-      } else {
-        process.stderr.write(`${e.message}\n\nCandidates:\n`);
-        for (const c of e.candidates) {
-          const year = c.release_date?.slice(0, 4) ?? "????";
-          process.stderr.write(
-            `  TMDB:${c.id}  ${c.title} (${year})  pop=${c.popularity.toFixed(1)}\n`,
-          );
-        }
-      }
-      return 1;
+      const candidates = e.candidates
+        .slice(0, 5)
+        .map((c) => `TMDB:${c.id} ${c.title} (${c.release_date?.slice(0, 4) ?? "????"})`)
+        .join(", ");
+      return {
+        blocked: true,
+        stage: "identify",
+        reason: `Multiple close TMDB candidates: ${candidates}`,
+        suggestion: "Pin the match with --tmdb-id or --imdb-id (or tmdb_id / imdb_id in batch.toml).",
+      };
     }
-    throw e;
+    return { blocked: true, stage: "identify", reason: (e as Error).message };
   }
   const { disc: discIdentified, movie } = persistMovie(db, ctx.disc, identified.details);
   log(`identified: tmdb=${movie.tmdb_id} imdb=${movie.imdb_id ?? "-"}`);
@@ -596,11 +1534,19 @@ async function runMoviePipeline(ctx: StageCtx): Promise<number> {
   persistMovieSelection(db, discIdentified.id, selection);
   log("selected");
 
-  if (opts.dryRun) {
-    if (opts.json) emitJson("plan", buildMoviePlanEvent(discIdentified, movie, selection, identified.source));
-    else printPlan({ db, disc: discIdentified, movie, selection, source: identified.source, dryRun: true });
-    return 0;
-  }
+  return {
+    data: { kind: "movie", movie, selection, identifySource: identified.source },
+    discIdentified,
+  };
+}
+
+async function executeMoviePlan(
+  ctx: StageCtx,
+  planData: MoviePlanData,
+  discIdentified: DiscRow,
+): Promise<number> {
+  const { db, opts, cfg, makemkvcon, discRoot, shortFp } = ctx;
+  const { movie, selection } = planData;
 
   const runId = startRun(db, discIdentified.id);
   try {
@@ -667,8 +1613,58 @@ async function runMoviePipeline(ctx: StageCtx): Promise<number> {
   }
 }
 
-async function runTvPipeline(ctx: StageCtx): Promise<number> {
-  const { db, opts, log, cfg, makemkvcon, discRoot, shortFp, titleRows, scanRes, parentDirName, minLengthSkipS } = ctx;
+async function runMoviePipeline(ctx: StageCtx): Promise<number> {
+  const planResult = await planMovie(ctx);
+  if ("blocked" in planResult) {
+    reportBlocked(ctx.opts, planResult);
+    return 1;
+  }
+  const { data, discIdentified } = planResult;
+  if (ctx.opts.dryRun) {
+    if (ctx.opts.json) {
+      emitJson(
+        "plan",
+        buildMoviePlanEvent(discIdentified, data.movie, data.selection, data.identifySource),
+      );
+    } else {
+      printPlan({
+        db: ctx.db,
+        disc: discIdentified,
+        movie: data.movie,
+        selection: data.selection,
+        source: data.identifySource,
+        dryRun: true,
+      });
+    }
+    return 0;
+  }
+  return await executeMoviePlan(ctx, data, discIdentified);
+}
+
+function reportBlocked(opts: CliOpts, b: BlockedReason): void {
+  if (opts.json) {
+    emitJson("error", {
+      message: b.reason,
+      stage: b.stage,
+      suggestion: b.suggestion ?? null,
+    });
+  } else {
+    process.stderr.write(`${b.reason}\n`);
+    if (b.suggestion) process.stderr.write(`  → ${b.suggestion}\n`);
+  }
+}
+
+// -------- TV pipeline: plan + execute halves -------------------------------
+
+type PersistedTv = ReturnType<typeof persistTvIdentification>;
+
+async function planTv(
+  ctx: StageCtx,
+): Promise<
+  | { data: TvPlanData; persisted: PersistedTv }
+  | BlockedReason
+> {
+  const { db, opts, log, cfg, titleRows, scanRes, parentDirName, minLengthSkipS } = ctx;
 
   const tmdb = new TmdbClient({ apiKey: cfg.tmdbApiKey! });
   let tvIdentified;
@@ -684,28 +1680,18 @@ async function runTvPipeline(ctx: StageCtx): Promise<number> {
     });
   } catch (e) {
     if (e instanceof AmbiguousTvMatchError) {
-      if (opts.json) {
-        emitJson("ambiguous_match", {
-          kind: "tv",
-          candidates: e.candidates.map((c) => ({
-            tmdb_id: c.id,
-            name: c.name,
-            year: c.first_air_date?.slice(0, 4) ?? null,
-            popularity: c.popularity,
-          })),
-        });
-      } else {
-        process.stderr.write(`${e.message}\n\nCandidates:\n`);
-        for (const c of e.candidates) {
-          const year = c.first_air_date?.slice(0, 4) ?? "????";
-          process.stderr.write(
-            `  TMDB:${c.id}  ${c.name} (${year})  pop=${c.popularity.toFixed(1)}\n`,
-          );
-        }
-      }
-      return 1;
+      const candidates = e.candidates
+        .slice(0, 5)
+        .map((c) => `TMDB:${c.id} ${c.name} (${c.first_air_date?.slice(0, 4) ?? "????"})`)
+        .join(", ");
+      return {
+        blocked: true,
+        stage: "identify",
+        reason: `Multiple close TMDB candidates: ${candidates}`,
+        suggestion: "Pin the show with --tmdb-show-id (or tmdb_show_id in batch.toml).",
+      };
     }
-    throw e;
+    return { blocked: true, stage: "identify", reason: (e as Error).message };
   }
   const persisted = persistTvIdentification(db, ctx.disc, tvIdentified);
   log(
@@ -714,49 +1700,82 @@ async function runTvPipeline(ctx: StageCtx): Promise<number> {
       `episodes=${persisted.episodes.length}`,
   );
 
-  const tvSelection = selectTv({
-    titles: titleRows,
-    episodes: persisted.episodes,
-    minLengthSkipS,
-    startingEpisode: opts.startingEpisode,
-    includeExtras: !!opts.includeExtras,
-  });
+  let tvSelection;
+  try {
+    tvSelection = selectTv({
+      titles: titleRows,
+      episodes: persisted.episodes,
+      minLengthSkipS,
+      startingEpisode: opts.startingEpisode,
+      includeExtras: !!opts.includeExtras,
+    });
+  } catch (e) {
+    return { blocked: true, stage: "select", reason: (e as Error).message };
+  }
+
+  // Episode-allocation collision guard (see spec-preflight §5 + the
+  // EpisodeAllocationConflictError that catches the "every disc defaulted
+  // to starting_episode=1" footgun).
+  const candidateEpIds = tvSelection.episodeMap.map((m) => m.episode.id);
+  const conflicts = findEpisodeAllocationConflicts(db, persisted.disc.id, candidateEpIds);
+  if (conflicts.length > 0) {
+    const highest = highestClaimedEpisodeInSeason(db, persisted.season.id, persisted.disc.id);
+    const err = new EpisodeAllocationConflictError(
+      conflicts,
+      persisted.season.season_number,
+      persisted.show.name,
+      highest !== null ? highest + 1 : null,
+    );
+    return {
+      blocked: true,
+      stage: "select",
+      reason: err.message,
+      ...(highest !== null
+        ? {
+            // Neutral wording: works in both contexts. init-batch will
+            // auto-patch this value into bdremuxer.batch.toml; plain
+            // batch users edit the TOML themselves. Either way, the
+            // user should sanity-check that this is actually the first
+            // episode on this disc — the value is computed from "next
+            // unclaimed episode in the season", which is almost always
+            // right but worth a glance for split-finale layouts.
+            suggestion: `Starting episode will be set to ${highest + 1} for this disc — verify this is correct.`,
+            fix: { kind: "set-starting-episode", value: highest + 1 },
+          }
+        : {
+            suggestion:
+              "Set starting_episode for this disc manually in bdremuxer.batch.toml — the conflict detector couldn't compute a suggestion.",
+          }),
+    };
+  }
+
   persistTvSelection(db, persisted.disc.id, tvSelection);
   log(
     `selected: ${tvSelection.episodeMap.length} episodes` +
       (tvSelection.cohort.outlierIncluded ? " (incl. outlier)" : ""),
   );
 
-  if (opts.dryRun) {
-    if (opts.json) {
-      emitJson(
-        "plan",
-        buildTvPlanEvent(
-          persisted.disc,
-          tvIdentified.show,
-          tvIdentified.season.season_number,
-          tvIdentified.effectiveEpisodeOrder,
-          tvSelection,
-          tvIdentified.source,
-          tvIdentified.seasonSource,
-        ),
-      );
-    } else {
-      printTvPlan({
-        db,
-        disc: persisted.disc,
-        show: tvIdentified.show,
-        seasonNumber: tvIdentified.season.season_number,
-        effectiveEpisodeOrder: tvIdentified.effectiveEpisodeOrder,
-        selection: tvSelection,
-        source: tvIdentified.source,
-        seasonSource: tvIdentified.seasonSource,
-        dryRun: true,
-      });
-    }
-    return 0;
-  }
+  return {
+    data: {
+      kind: "tv",
+      show: persisted.show,
+      season: persisted.season,
+      episodes: persisted.episodes,
+      selection: tvSelection,
+      identifySource: tvIdentified.source,
+      seasonSource: tvIdentified.seasonSource,
+      effectiveEpisodeOrder: tvIdentified.effectiveEpisodeOrder,
+    },
+    persisted,
+  };
+}
 
+async function executeTvPlan(
+  ctx: StageCtx,
+  planData: TvPlanData,
+  persisted: PersistedTv,
+): Promise<number> {
+  const { db, opts, cfg, makemkvcon, discRoot, shortFp } = ctx;
   const tvRunId = startRun(db, persisted.disc.id);
   try {
     const tvPrinter = makeTvProgressPrinter(!!opts.json);
@@ -767,10 +1786,10 @@ async function runTvPipeline(ctx: StageCtx): Promise<number> {
       makemkvcon,
       discRoot,
       disc: persisted.disc,
-      show: persisted.show,
-      season: persisted.season,
-      episodeMap: tvSelection.episodeMap,
-      extras: tvSelection.extras,
+      show: planData.show,
+      season: planData.season,
+      episodeMap: planData.selection.episodeMap,
+      extras: planData.selection.extras,
       runId: tvRunId,
       force: !!opts.force,
       shortFp,
@@ -796,9 +1815,9 @@ async function runTvPipeline(ctx: StageCtx): Promise<number> {
       bdremuxerVersion: PKG_VERSION,
       media: {
         kind: "tv",
-        show: persisted.show,
-        season: persisted.season,
-        episodes: persisted.episodes,
+        show: planData.show,
+        season: planData.season,
+        episodes: planData.episodes,
       },
     });
 
@@ -806,12 +1825,12 @@ async function runTvPipeline(ctx: StageCtx): Promise<number> {
       emitJson("done", {
         media_kind: "tv",
         show: {
-          tmdb_id: persisted.show.tmdb_id,
-          imdb_id: persisted.show.imdb_id,
-          name: persisted.show.name,
-          first_air_year: persisted.show.first_air_year,
+          tmdb_id: planData.show.tmdb_id,
+          imdb_id: planData.show.imdb_id,
+          name: planData.show.name,
+          first_air_year: planData.show.first_air_year,
         },
-        season: { season_number: persisted.season.season_number },
+        season: { season_number: planData.season.season_number },
         episodes: remuxResult.episodes.map((o) => ({
           episode_number: o.episode.episode_number,
           name: o.episode.name,
@@ -824,8 +1843,8 @@ async function runTvPipeline(ctx: StageCtx): Promise<number> {
       });
     } else {
       printTvDone({
-        show: persisted.show,
-        seasonNumber: persisted.season.season_number,
+        show: planData.show,
+        seasonNumber: planData.season.season_number,
         episodes: remuxResult.episodes,
         extras: remuxResult.extras,
         manifestPath,
@@ -838,6 +1857,45 @@ async function runTvPipeline(ctx: StageCtx): Promise<number> {
     markDiscFailed(db, persisted.disc.id, "remuxed");
     throw e;
   }
+}
+
+async function runTvPipeline(ctx: StageCtx): Promise<number> {
+  const planResult = await planTv(ctx);
+  if ("blocked" in planResult) {
+    reportBlocked(ctx.opts, planResult);
+    return 1;
+  }
+  const { data, persisted } = planResult;
+  if (ctx.opts.dryRun) {
+    if (ctx.opts.json) {
+      emitJson(
+        "plan",
+        buildTvPlanEvent(
+          persisted.disc,
+          data.show,
+          data.season.season_number,
+          data.effectiveEpisodeOrder,
+          data.selection,
+          data.identifySource,
+          data.seasonSource,
+        ),
+      );
+    } else {
+      printTvPlan({
+        db: ctx.db,
+        disc: persisted.disc,
+        show: data.show,
+        seasonNumber: data.season.season_number,
+        effectiveEpisodeOrder: data.effectiveEpisodeOrder,
+        selection: data.selection,
+        source: data.identifySource,
+        seasonSource: data.seasonSource,
+        dryRun: true,
+      });
+    }
+    return 0;
+  }
+  return await executeTvPlan(ctx, data, persisted);
 }
 
 // -----------------------------------------------------------------------
@@ -1234,31 +2292,32 @@ function printTvDone(p: {
 // BDMV path helpers
 // -----------------------------------------------------------------------
 
-function normalizeDiscRoot(input: string): string {
+/**
+ * Compute the "library directory" — the parent of the disc location —
+ * used as `defaultOutDir` when no `--out` / `$BDREMUXER_OUTPUT_DIR` is
+ * set. Computed without opening a DiscSource because config loading
+ * needs to happen before the source can be opened (the ISO backend's
+ * mount root sits under `<out>/.bdremuxer/mounts`).
+ *
+ * - Folder input pointing at BDMV/ or BDMV/index.bdmv: collapse to the
+ *   disc root, return its parent.
+ * - Folder input pointing at the disc root: return its parent.
+ * - `.iso` file: return its parent directory.
+ */
+function defaultLibraryDir(input: string): string {
   const abs = resolve(input);
-  const base = basename(abs);
-  if (base === "index.bdmv") return resolve(abs, "..", "..");
-  if (base === "BDMV") return resolve(abs, "..");
-  return abs;
+  if (/\.iso$/i.test(abs)) return dirname(abs);
+  return dirname(normalizeBdmvDir(input));
 }
 
-function validateBdmv(discRoot: string): { ok: true } | { ok: false; error: string } {
-  try {
-    const st = statSync(discRoot);
-    if (!st.isDirectory()) return { ok: false, error: `Not a directory: ${discRoot}` };
-  } catch {
-    return { ok: false, error: `Path does not exist: ${discRoot}` };
-  }
-  try {
-    const st = statSync(join(discRoot, "BDMV", "index.bdmv"));
-    if (!st.isFile()) {
-      return { ok: false, error: `${discRoot}/BDMV/index.bdmv is not a file` };
-    }
-  } catch {
-    return {
-      ok: false,
-      error: `No BDMV/index.bdmv under ${discRoot}. Point at the directory that contains the BDMV folder.`,
-    };
-  }
-  return { ok: true };
+/**
+ * Format a DiscSource open-time error for single-disc / executePlannedDisc
+ * stderr output, appending the suggestion line when one is available.
+ * The batch preflight uses the structured (code, suggestion) fields on
+ * the blocked plan instead and goes through formatIssueReport.
+ */
+function formatDiscOpenError(err: unknown): string {
+  const msg = (err as Error).message;
+  const { suggestion } = classifyDiscOpenError(err);
+  return suggestion ? `${msg}\n  → ${suggestion}` : msg;
 }

@@ -1,0 +1,63 @@
+name: release
+
+# Triggered by pushing a tag matching v* (e.g. v0.1.0, v1.0.0-rc1).
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  # Required so action-gh-release can create the release entry.
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install (frozen)
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun test
+
+      - name: Build standalone macOS arm64 binary
+        run: bun run build
+
+      # Belt-and-braces smoke test before publishing. If the binary won't
+      # even print --version cleanly we want to fail before creating the
+      # release entry, not after users download a broken artefact.
+      - name: Smoke-test the binary
+        run: |
+          set -euo pipefail
+          BIN=./dist/bdremuxer-macos-arm64
+          test -x "$BIN" || { echo "Binary missing or not executable: $BIN"; exit 1; }
+          BIN_VERSION=$("$BIN" --version)
+          PKG_VERSION=$(bun -e 'console.log(require("./package.json").version)')
+          if [ "$BIN_VERSION" != "$PKG_VERSION" ]; then
+            echo "Version mismatch: binary='$BIN_VERSION' package='$PKG_VERSION'"
+            exit 1
+          fi
+          # Help should render without throwing.
+          "$BIN" --help > /dev/null
+          "$BIN" batch --help > /dev/null
+          "$BIN" init-batch --help > /dev/null
+          echo "Smoke test passed: bdremuxer v$BIN_VERSION"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Tag is taken from the push event (refs/tags/v...). Release
+          # name defaults to the tag.
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/bdremuxer-macos-arm64
+            dist/cli.js.map

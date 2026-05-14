@@ -29,8 +29,6 @@ from online sources.
 - No track/subtitle filtering — every track from the chosen titles is kept.
   (Filtering is a likely follow-up; the schema should leave room for it.)
 - No GUI. CLI only.
-- No ISO/raw-disc ingestion — caller must mount the disc and point at the
-  BDMV folder. (ISO support is a clean follow-up.)
 - No DRM circumvention beyond what MakeMKV already handles.
 - No writing into the MKV header (`mkvpropedit`) in v1 — leave headers as
   MakeMKV produces them; revisit later if needed.
@@ -38,7 +36,11 @@ from online sources.
 ## 3. Inputs
 
 - **Path to a BDMV directory** (positional arg). Must contain `BDMV/index.bdmv`.
-- **Output directory** (`--out`, default `./out`).
+- **Output directory** (`--out`). Defaults are context-aware: for a
+  single-disc run, the output dir is the parent of the input BDMV
+  folder (i.e., a sibling of the input). For batch mode, it's the
+  batch parent directory itself. `--out DIR` or `$BDREMUXER_OUTPUT_DIR`
+  override.
 - **Config file** (`--config`, default `~/.config/bdremuxer/config.toml`)
   carrying API keys and user defaults.
 - **Media-type hint** (`--type movie|tv|auto`, default `auto`). `auto`
@@ -619,6 +621,20 @@ cost is small (~50 KB into the standalone binary).
     GitHub Release on tag push (`v*`). Verifies the release binary
     runs `--version` cleanly before publishing. (Homebrew tap stays
     out of scope; can be added later from the release artefact.)
+11. **M11 — Preflight pass.** Two-phase batch flow (plan → rip) by
+    default; `init-batch` also runs preflight after writing the TOML.
+    Surfaces glob mis-matches, ambiguous TMDB hits, missing
+    `starting_episode` (the M-post conflict guard), and stale
+    `status='done'` rows before any rip starts. Design lives in
+    [`spec-preflight.md`](./spec-preflight.md); open questions Q14-Q18
+    documented there.
+12. **M12 — ISO ingestion.** `bdremuxer /path/to/disc.iso` and `batch`
+    walks that find `.iso` files alongside BDMV folders. Behind a
+    `DiscSource` abstraction with a macOS `hdiutil` backend; once
+    mounted, every downstream stage sees a normal BDMV directory.
+    Includes per-ISO sidecar TOML resolution, signal-safe mount
+    cleanup, and `iso_attach_start` / `iso_attached` / `iso_detach`
+    JSON events. Design lives in [`spec-iso.md`](./spec-iso.md).
 
 ## 13. Open questions
 
@@ -640,7 +656,8 @@ the body):
   `Ns|Nm|Nh` or `false` (keep everything).
 - ✅ **Q7 Compile targets.** macOS arm64 only for v1.
 - ✅ **Q8 Distribution.** GitHub Releases with standalone binary attached
-  (lands in M10; Homebrew tap later).
+  (implemented in M10 via `.github/workflows/release.yml`; Homebrew tap
+  later if needed).
 - ✅ **Q9 Auto-classify confidence.** Require explicit `--type` when the
   heuristic is unsure rather than guessing. (§5.3)
 - ✅ **Q10 Episode cohort tolerance.** Pull in a single outlier within

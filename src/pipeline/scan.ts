@@ -2,9 +2,10 @@
 
 import { createHash } from "node:crypto";
 import { readdirSync, statSync } from "node:fs";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 
-import type { DB, DiscRow } from "../db.ts";
+import type { DB, DiscRow, DiscStatus } from "../db.ts";
+import type { DiscSource } from "../disc/index.ts";
 
 export type ScanResult = {
   fingerprint: string;
@@ -12,21 +13,22 @@ export type ScanResult = {
   disc: DiscRow;
 };
 
-export async function scan(
-  db: DB,
-  discRoot: string,
-): Promise<ScanResult> {
-  const fingerprint = await computeFingerprint(discRoot);
-  const volumeLabel = basename(discRoot) || null;
-  const disc = upsertDisc(db, { fingerprint, sourcePath: discRoot, volumeLabel });
+export async function scan(db: DB, source: DiscSource): Promise<ScanResult> {
+  const fingerprint = await computeFingerprint(source.bdmvPath);
+  const volumeLabel = source.label || null;
+  const disc = upsertDisc(db, {
+    fingerprint,
+    sourcePath: source.originalPath,
+    volumeLabel,
+  });
   return { fingerprint, volumeLabel: volumeLabel ?? "", disc };
 }
 
-async function computeFingerprint(discRoot: string): Promise<string> {
-  const indexBdmv = join(discRoot, "BDMV", "index.bdmv");
+async function computeFingerprint(bdmvDir: string): Promise<string> {
+  const indexBdmv = join(bdmvDir, "BDMV", "index.bdmv");
   const indexBytes = new Uint8Array(await Bun.file(indexBdmv).arrayBuffer());
 
-  const m2ts = listM2ts(join(discRoot, "BDMV"));
+  const m2ts = listM2ts(join(bdmvDir, "BDMV"));
   m2ts.sort((a, b) => a.relPath.localeCompare(b.relPath));
 
   const h = createHash("sha256");
@@ -72,13 +74,23 @@ function upsertDisc(
     .get(opts.fingerprint);
 
   if (existing) {
+    // Preserve a previously-completed status so the orchestrator's
+    // `status === 'done'` early-out can fire on re-runs. Any non-terminal
+    // status gets rewound to 'scanned' — the pipeline will march it forward
+    // again as each stage's persist call updates it.
+    const nextStatus: DiscStatus = existing.status === "done" ? "done" : "scanned";
     db.run(
       `UPDATE disc
-       SET source_path = ?, volume_label = ?, status = 'scanned', updated_at = ?
+       SET source_path = ?, volume_label = ?, status = ?, updated_at = ?
        WHERE id = ?`,
-      [opts.sourcePath, opts.volumeLabel, now, existing.id],
+      [opts.sourcePath, opts.volumeLabel, nextStatus, now, existing.id],
     );
-    return { ...existing, source_path: opts.sourcePath, volume_label: opts.volumeLabel, status: "scanned" };
+    return {
+      ...existing,
+      source_path: opts.sourcePath,
+      volume_label: opts.volumeLabel,
+      status: nextStatus,
+    };
   }
 
   const inserted = db

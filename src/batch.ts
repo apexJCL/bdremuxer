@@ -9,7 +9,7 @@
 //                 → per-disc bdremuxer.toml sidecar
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import { parse as parseToml } from "smol-toml";
 
 import { globMatch } from "./parse/glob.ts";
@@ -23,8 +23,20 @@ import type { EpisodeOrder } from "./db.ts";
 export type DiscDir = {
   /** Path relative to the batch root, used as glob-match input. */
   relPath: string;
-  /** Absolute path to the directory that contains the BDMV folder. */
+  /**
+   * For `bdmv-dir`: absolute path to the directory containing the BDMV
+   * folder. For `iso`: absolute path to the `.iso` file itself.
+   * Either is a valid input to `openDiscSource`.
+   */
   absPath: string;
+  /**
+   * Discriminator added in M12. The DiscSource factory dispatches on
+   * `absPath` shape directly, so consumers don't need to branch on
+   * this — it's exposed for diagnostics and for the few callers (e.g.
+   * sidecar resolution) that pick a different candidate path based on
+   * the input kind.
+   */
+  kind: "bdmv-dir" | "iso";
 };
 
 export function walkBdmvFolders(root: string): DiscDir[] {
@@ -33,7 +45,7 @@ export function walkBdmvFolders(root: string): DiscDir[] {
     // If this directory itself is a disc root (contains BDMV/index.bdmv),
     // record it and stop descending — discs don't nest inside each other.
     if (isDiscRoot(abs)) {
-      out.push({ relPath: rel, absPath: abs });
+      out.push({ relPath: rel, absPath: abs, kind: "bdmv-dir" });
       return;
     }
     let entries;
@@ -43,10 +55,17 @@ export function walkBdmvFolders(root: string): DiscDir[] {
       return;
     }
     for (const ent of entries) {
-      if (!ent.isDirectory()) continue;
-      // Skip the `.bdremuxer` working dir and dotfile dirs entirely.
-      if (ent.name.startsWith(".")) continue;
-      walk(join(abs, ent.name), rel ? `${rel}/${ent.name}` : ent.name);
+      if (ent.name.startsWith(".")) continue; // skip dotfiles / .bdremuxer
+      const childAbs = join(abs, ent.name);
+      const childRel = rel ? `${rel}/${ent.name}` : ent.name;
+      if (ent.isDirectory()) {
+        walk(childAbs, childRel);
+      } else if (ent.isFile() && /\.iso$/i.test(ent.name)) {
+        // ISO files become disc entries in their own right. We don't
+        // stop descending — a parent dir can hold both an ISO and a
+        // subdirectory of unpacked BDMVs.
+        out.push({ relPath: childRel, absPath: childAbs, kind: "iso" });
+      }
     }
   };
   walk(root, "");
@@ -88,8 +107,58 @@ export function loadBatchOverrides(parentRoot: string): GlobBlock[] {
   return blocks;
 }
 
-export function loadSidecarOverrides(discRoot: string): TomlOverrides | null {
-  const path = join(discRoot, "bdremuxer.toml");
+// Per-disc sidecar resolution. The input is the disc's `absPath`:
+//
+//   - bdmv-dir disc: `<discRoot>/bdremuxer.toml` (the original M8 behaviour)
+//   - iso disc: `<dirname(iso)>/<basename>.bdremuxer.toml` first; falls back
+//               to `<dirname(iso)>/bdremuxer.toml` only when the ISO sits
+//               alone in its parent (no other .iso files in the same dir),
+//               so a `bdremuxer.toml` covering one ISO in a per-disc folder
+//               feels natural without leaking onto sibling ISOs.
+//
+// (specs/spec-iso.md §7.)
+export function loadSidecarOverrides(discAbsPath: string): TomlOverrides | null {
+  let st;
+  try {
+    st = statSync(discAbsPath);
+  } catch {
+    return null;
+  }
+  if (st.isFile() && /\.iso$/i.test(discAbsPath)) {
+    return loadIsoSidecar(discAbsPath);
+  }
+  // bdmv-dir backend: discAbsPath is the disc directory.
+  return readSidecarToml(join(discAbsPath, "bdremuxer.toml"));
+}
+
+function loadIsoSidecar(isoPath: string): TomlOverrides | null {
+  const parent = dirname(isoPath);
+  // Strip the .iso extension case-insensitively. extname() preserves case,
+  // so passing it to basename() removes whatever the user actually typed.
+  const stem = basename(isoPath, extname(isoPath));
+  const named = readSidecarToml(join(parent, `${stem}.bdremuxer.toml`));
+  if (named) return named;
+  if (parentHasOtherIsos(parent, isoPath)) return null;
+  return readSidecarToml(join(parent, "bdremuxer.toml"));
+}
+
+function parentHasOtherIsos(parent: string, selfIso: string): boolean {
+  const selfName = basename(selfIso);
+  let entries;
+  try {
+    entries = readdirSync(parent, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  for (const ent of entries) {
+    if (!ent.isFile()) continue;
+    if (ent.name === selfName) continue;
+    if (/\.iso$/i.test(ent.name)) return true;
+  }
+  return false;
+}
+
+function readSidecarToml(path: string): TomlOverrides | null {
   let text: string;
   try {
     text = readFileSync(path, "utf8");
