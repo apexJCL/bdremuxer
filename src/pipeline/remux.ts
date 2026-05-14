@@ -21,12 +21,14 @@ import type {
   TvShowRow,
 } from "../db.ts";
 import { runMkv } from "../makemkv/cli.ts";
+import { flatTitlePath } from "../naming/flat.ts";
 import {
   plexMoviePaths,
   plexTvPaths,
   type MovieIdentity,
   type TvIdentity,
 } from "../naming/plex.ts";
+import type { OutputFormat } from "../opts.ts";
 import { setRunLogPath } from "./run.ts";
 
 // -----------------------------------------------------------------------
@@ -110,6 +112,7 @@ function setupLog(outDir: string, shortFp: string, runId: number, db: DB): strin
 export type MovieRemuxOpts = {
   db: DB;
   outDir: string;
+  outputFormat: OutputFormat;
   makemkvcon: string;
   discRoot: string;
   disc: DiscRow;
@@ -123,6 +126,14 @@ export type MovieRemuxOpts = {
   onExtraProgress?: (idx: number, total: number, frac: number, task?: string) => void;
   onTitleDone?: (kind: "main" | "extra", idx: number, total: number, skipped: boolean) => void;
 };
+
+function isFlat(layout: OutputFormat): boolean {
+  return layout === "flat";
+}
+
+function discDisplayName(disc: DiscRow): string {
+  return disc.volume_label || disc.fingerprint.slice(0, 12);
+}
 
 export type MovieRemuxResult = {
   main: { title: TitleRow; outputPath: string; skipped: boolean };
@@ -139,17 +150,22 @@ export async function remuxMovieMain(opts: MovieRemuxOpts): Promise<MovieRemuxRe
   };
   const paths = plexMoviePaths(opts.outDir, identity);
   const logPath = setupLog(opts.outDir, opts.shortFp, opts.runId, opts.db);
+  const flat = isFlat(opts.outputFormat);
+  const discName = discDisplayName(opts.disc);
 
-  mkdirSync(paths.folder, { recursive: true });
+  if (!flat) mkdirSync(paths.folder, { recursive: true });
 
   // Main feature
+  const mainTarget = flat
+    ? flatTitlePath(opts.outDir, discName, opts.mainTitle.makemkv_id)
+    : paths.mainMkv;
   const main = await remuxOneTitle({
     makemkvcon: opts.makemkvcon,
     discRoot: opts.discRoot,
     outDir: opts.outDir,
     shortFp: opts.shortFp,
     title: opts.mainTitle,
-    targetPath: paths.mainMkv,
+    targetPath: mainTarget,
     logPath,
     force: opts.force,
     onProgress: opts.onMainProgress,
@@ -164,7 +180,9 @@ export async function remuxMovieMain(opts: MovieRemuxOpts): Promise<MovieRemuxRe
   const extrasOut: MovieRemuxResult["extras"] = [];
   for (let i = 0; i < opts.extras.length; i++) {
     const t = opts.extras[i]!;
-    const targetPath = join(paths.extrasDir, extrasFileName(t.makemkv_id));
+    const targetPath = flat
+      ? flatTitlePath(opts.outDir, discName, t.makemkv_id)
+      : join(paths.extrasDir, extrasFileName(t.makemkv_id));
     const res = await remuxOneTitle({
       makemkvcon: opts.makemkvcon,
       discRoot: opts.discRoot,
@@ -205,6 +223,7 @@ export async function remuxMovieMain(opts: MovieRemuxOpts): Promise<MovieRemuxRe
 export type TvRemuxOpts = {
   db: DB;
   outDir: string;
+  outputFormat: OutputFormat;
   makemkvcon: string;
   discRoot: string;
   disc: DiscRow;
@@ -239,24 +258,28 @@ export async function remuxTvEpisodes(opts: TvRemuxOpts): Promise<TvRemuxResult>
     tmdb_id: opts.show.tmdb_id,
   };
   const logPath = setupLog(opts.outDir, opts.shortFp, opts.runId, opts.db);
+  const flat = isFlat(opts.outputFormat);
+  const discName = discDisplayName(opts.disc);
 
   // Episodes
   const episodesOut: TvRemuxResult["episodes"] = [];
   const epTotal = opts.episodeMap.length;
   for (let i = 0; i < opts.episodeMap.length; i++) {
     const { title, episode } = opts.episodeMap[i]!;
-    const paths = plexTvPaths(opts.outDir, showIdentity, {
-      seasonNumber: opts.season.season_number,
-      episodeNumber: episode.episode_number,
-      episodeName: episode.name,
-    });
+    const targetPath = flat
+      ? flatTitlePath(opts.outDir, discName, title.makemkv_id)
+      : plexTvPaths(opts.outDir, showIdentity, {
+          seasonNumber: opts.season.season_number,
+          episodeNumber: episode.episode_number,
+          episodeName: episode.name,
+        }).episodeMkv;
     const res = await remuxOneTitle({
       makemkvcon: opts.makemkvcon,
       discRoot: opts.discRoot,
       outDir: opts.outDir,
       shortFp: opts.shortFp,
       title,
-      targetPath: paths.episodeMkv,
+      targetPath,
       logPath,
       force: opts.force,
       onProgress: opts.onEpisodeProgress
@@ -271,17 +294,21 @@ export async function remuxTvEpisodes(opts: TvRemuxOpts): Promise<TvRemuxResult>
     opts.onTitleDone?.("episode", i + 1, epTotal, res.skipped);
   }
 
-  // Extras (placed under Season NN/extras/ — needs any plexTvPaths to get the dir)
+  // Extras (under Season NN/extras/ in plex; flat dumps them next to episodes).
   const extrasOut: TvRemuxResult["extras"] = [];
   if (opts.extras.length > 0) {
-    const samplePaths = plexTvPaths(opts.outDir, showIdentity, {
-      seasonNumber: opts.season.season_number,
-      episodeNumber: 1,
-      episodeName: null,
-    });
+    const samplePaths = flat
+      ? null
+      : plexTvPaths(opts.outDir, showIdentity, {
+          seasonNumber: opts.season.season_number,
+          episodeNumber: 1,
+          episodeName: null,
+        });
     for (let i = 0; i < opts.extras.length; i++) {
       const t = opts.extras[i]!;
-      const targetPath = join(samplePaths.extrasDir, extrasFileName(t.makemkv_id));
+      const targetPath = flat
+        ? flatTitlePath(opts.outDir, discName, t.makemkv_id)
+        : join(samplePaths!.extrasDir, extrasFileName(t.makemkv_id));
       const res = await remuxOneTitle({
         makemkvcon: opts.makemkvcon,
         discRoot: opts.discRoot,

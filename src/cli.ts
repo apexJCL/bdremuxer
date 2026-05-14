@@ -1,13 +1,18 @@
 #!/usr/bin/env bun
 //
-// M7: CLI parsing migrated to commander. Options, choices, integer
-// validation, help text, and version are now declared declaratively. The
-// pipeline logic in runPipeline() is unchanged from M6 — only the argv
-// layer is different.
+// M8: same single-disc flow as M7, plus a `batch <parent-dir>` subcommand
+// and a `--output-format=plex|flat` option.
 
 import { Command, InvalidArgumentError, Option } from "commander";
 import { statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+
+import {
+  loadBatchOverrides,
+  resolveDiscOverrides,
+  walkBdmvFolders,
+} from "./batch.ts";
+import type { CliOpts } from "./opts.ts";
 
 import { discoverMakemkvcon } from "./makemkv/discover.ts";
 import { runInfo } from "./makemkv/cli.ts";
@@ -66,35 +71,76 @@ function parseIntArg(value: string): number {
 }
 
 // -----------------------------------------------------------------------
-// Typed view of the parsed options
-// -----------------------------------------------------------------------
-
-type CliOpts = {
-  type: "movie" | "tv" | "auto";
-  title?: string;
-  tmdbId?: number;
-  imdbId?: string;
-  show?: string;
-  tmdbShowId?: number;
-  season?: number;
-  startingEpisode: number;
-  episodeOrder: EpisodeOrder;
-  includeExtras?: boolean;
-  minLengthSkip: string;
-  out?: string;
-  db?: string;
-  makemkvcon?: string;
-  dryRun?: boolean;
-  force?: boolean;
-  verbose?: boolean;
-};
-
-// -----------------------------------------------------------------------
 // Commander setup
 // -----------------------------------------------------------------------
 
-const program = new Command();
+// All pipeline-affecting flags. Applied to both the root command and the
+// `batch` subcommand so users can put flags either before or after the
+// subcommand name (commander doesn't inherit options across commands).
+function addPipelineOptions(cmd: Command): Command {
+  cmd.addOption(
+    new Option("--type <kind>", "media-type override (default: auto-detect)")
+      .choices(["movie", "tv", "auto"])
+      .default("auto"),
+  );
 
+  // Movie identification
+  cmd.option("--title <name>", 'movie search query hint, e.g. "The Thing (1982)"');
+  cmd.option("--tmdb-id <id>", "skip search; fetch this TMDB movie id directly", parseIntArg);
+  cmd.option("--imdb-id <id>", "skip search; look up by IMDb id (ttNNNNNNN)");
+
+  // TV identification
+  cmd.option("--show <name>", "TV show search query hint");
+  cmd.option(
+    "--tmdb-show-id <id>",
+    "skip show search; fetch this TMDB show id directly",
+    parseIntArg,
+  );
+  cmd.option(
+    "--season <n>",
+    "season number (required for TV if not parseable from the path)",
+    parseIntArg,
+  );
+  cmd.option(
+    "--starting-episode <n>",
+    "first episode number on this disc",
+    parseIntArg,
+    1,
+  );
+  cmd.addOption(
+    new Option(
+      "--episode-order <order>",
+      "TMDB episode ordering (only 'broadcast' is implemented in v1)",
+    )
+      .choices(["broadcast", "production", "dvd"])
+      .default("broadcast"),
+  );
+
+  // Selection
+  cmd.option("--include-extras", "remux non-main / non-episode titles into extras/");
+  cmd.option(
+    "--min-length-skip <duration>",
+    'skip titles shorter than this; e.g. "90s", "5m", "1h", or "false"',
+    "90s",
+  );
+
+  // Paths / behaviour
+  cmd.option("--out <dir>", "output directory (also where the SQLite DB lives)");
+  cmd.option("--db <path>", "override the SQLite DB path");
+  cmd.option("--makemkvcon <path>", "override the makemkvcon binary location");
+  cmd.addOption(
+    new Option("--output-format <format>", "output layout")
+      .choices(["plex", "flat", "jellyfin", "kodi"])
+      .default("plex"),
+  );
+  cmd.option("--dry-run", "stop after select; print plan only (no remux)");
+  cmd.option("--force", "re-probe and re-remux even if cached / done");
+  cmd.option("-v, --verbose", "extra logging on stderr");
+
+  return cmd;
+}
+
+const program = new Command();
 program
   .name("bdremuxer")
   .description(
@@ -105,70 +151,7 @@ program
   .helpOption("-h, --help", "show this help and exit")
   .showHelpAfterError("(run with --help for the full option list)");
 
-// Classification ---------------------------------------------------------
-program.addOption(
-  new Option("--type <kind>", "media-type override (default: auto-detect)")
-    .choices(["movie", "tv", "auto"])
-    .default("auto"),
-);
-
-// Movie identification ---------------------------------------------------
-program.option("--title <name>", 'movie search query hint, e.g. "The Thing (1982)"');
-program.option(
-  "--tmdb-id <id>",
-  "skip search; fetch this TMDB movie id directly",
-  parseIntArg,
-);
-program.option(
-  "--imdb-id <id>",
-  "skip search; look up by IMDb id (ttNNNNNNN)",
-);
-
-// TV identification ------------------------------------------------------
-program.option("--show <name>", "TV show search query hint");
-program.option(
-  "--tmdb-show-id <id>",
-  "skip show search; fetch this TMDB show id directly",
-  parseIntArg,
-);
-program.option(
-  "--season <n>",
-  "season number (required for TV if not parseable from the path)",
-  parseIntArg,
-);
-program.option(
-  "--starting-episode <n>",
-  "first episode number on this disc",
-  parseIntArg,
-  1,
-);
-program.addOption(
-  new Option(
-    "--episode-order <order>",
-    "TMDB episode ordering (only 'broadcast' is implemented in v1)",
-  )
-    .choices(["broadcast", "production", "dvd"])
-    .default("broadcast"),
-);
-
-// Selection --------------------------------------------------------------
-program.option(
-  "--include-extras",
-  "remux every surviving non-main / non-episode title into extras/",
-);
-program.option(
-  "--min-length-skip <duration>",
-  'skip titles shorter than this; e.g. "90s", "5m", "1h", or "false"',
-  "90s",
-);
-
-// Paths / behaviour ------------------------------------------------------
-program.option("--out <dir>", "output directory (also where the SQLite DB lives)");
-program.option("--db <path>", "override the SQLite DB path");
-program.option("--makemkvcon <path>", "override the makemkvcon binary location");
-program.option("--dry-run", "stop after select; print plan only (no remux)");
-program.option("--force", "re-probe and re-remux even if cached / done");
-program.option("-v, --verbose", "extra logging on stderr");
+addPipelineOptions(program);
 
 program.addHelpText(
   "after",
@@ -183,16 +166,42 @@ Environment:
   BDREMUXER_TMDB_API_KEY   required for identification
   BDREMUXER_OUTPUT_DIR     default for --out
   BDREMUXER_DB_PATH        default for --db
-  MAKEMKVCON               default for --makemkvcon`,
+  MAKEMKVCON               default for --makemkvcon
+
+See also:
+  bdremuxer batch --help   process a parent directory of BDMV folders`,
 );
 
 program
   .argument("<bdmv-path>", "path to a BDMV directory (or its parent)")
-  .action(async (bdmvPath: string) => {
-    const opts = program.opts<CliOpts>();
+  .action(async function rootAction(this: Command, bdmvPath: string) {
+    const opts = this.opts<CliOpts>();
     const code = await runPipeline(bdmvPath, opts);
     process.exit(code);
   });
+
+// --- batch subcommand ---------------------------------------------------
+
+const batchCmd = program.command("batch <parent-dir>")
+  .description("walk a directory of BDMV folders and process each in sequence");
+addPipelineOptions(batchCmd);
+batchCmd.option("--continue-on-error", "keep going after a disc fails");
+batchCmd.addHelpText(
+  "after",
+  `
+Override resolution (per disc):
+  CLI flags → matching glob blocks from <parent-dir>/bdremuxer.batch.toml
+            → per-disc sidecar at <parent-dir>/<disc>/bdremuxer.toml
+
+The batch TOML uses subdirectory globs as block keys; the sidecar TOML
+uses top-level keys. Both use snake_case versions of the CLI flag names
+(e.g. starting_episode = 1).`,
+);
+batchCmd.action(async function batchAction(this: Command, parentDir: string) {
+  const opts = this.opts<CliOpts & { continueOnError?: boolean }>();
+  const code = await runBatch(parentDir, opts);
+  process.exit(code);
+});
 
 await program.parseAsync(process.argv);
 
@@ -347,6 +356,77 @@ async function runPipeline(bdmvArg: string, opts: CliOpts): Promise<number> {
   }
 }
 
+// -----------------------------------------------------------------------
+// Batch orchestrator
+// -----------------------------------------------------------------------
+
+async function runBatch(
+  parentDir: string,
+  opts: CliOpts & { continueOnError?: boolean },
+): Promise<number> {
+  let parentAbs: string;
+  try {
+    parentAbs = resolve(parentDir);
+    const st = statSync(parentAbs);
+    if (!st.isDirectory()) {
+      process.stderr.write(`Not a directory: ${parentAbs}\n`);
+      return 1;
+    }
+  } catch {
+    process.stderr.write(`Path does not exist: ${parentDir}\n`);
+    return 1;
+  }
+
+  const discs = walkBdmvFolders(parentAbs);
+  if (discs.length === 0) {
+    process.stderr.write(`No BDMV folders found under ${parentAbs}\n`);
+    return 1;
+  }
+
+  const batchBlocks = loadBatchOverrides(parentAbs);
+  if (opts.verbose) {
+    process.stderr.write(
+      `[bdremuxer] batch: ${discs.length} discs under ${parentAbs}\n` +
+        (batchBlocks.length > 0
+          ? `[bdremuxer] batch.toml: ${batchBlocks.length} glob block(s) loaded\n`
+          : ""),
+    );
+  }
+
+  const results: Array<{ relPath: string; code: number }> = [];
+  for (let i = 0; i < discs.length; i++) {
+    const disc = discs[i]!;
+    const effectiveOpts = resolveDiscOverrides({
+      cliOpts: opts,
+      discRelPath: disc.relPath,
+      discAbsPath: disc.absPath,
+      batchBlocks,
+    });
+
+    process.stderr.write(
+      `\n=== Disc ${i + 1}/${discs.length}: ${disc.relPath} ===\n`,
+    );
+    const code = await runPipeline(disc.absPath, effectiveOpts);
+    results.push({ relPath: disc.relPath, code });
+    if (code !== 0 && !opts.continueOnError) {
+      process.stderr.write(
+        `\nDisc failed (exit ${code}); stopping. Pass --continue-on-error to keep going.\n`,
+      );
+      break;
+    }
+  }
+
+  const ok = results.filter((r) => r.code === 0).length;
+  const failed = results.filter((r) => r.code !== 0);
+  process.stderr.write(
+    `\n=== Batch summary ===\n  ${ok}/${results.length} disc(s) ok\n`,
+  );
+  for (const r of failed) {
+    process.stderr.write(`  FAILED: ${r.relPath} (exit ${r.code})\n`);
+  }
+  return failed.length > 0 ? 1 : 0;
+}
+
 type StageCtx = {
   db: DB;
   disc: DiscRow;
@@ -420,6 +500,7 @@ async function runMoviePipeline(ctx: StageCtx): Promise<number> {
     const remuxResult = await remuxMovieMain({
       db,
       outDir: cfg.outDir,
+      outputFormat: opts.outputFormat,
       makemkvcon,
       discRoot,
       disc: discIdentified,
@@ -443,6 +524,7 @@ async function runMoviePipeline(ctx: StageCtx): Promise<number> {
     const { manifestPath } = finalize({
       db,
       outDir: cfg.outDir,
+      outputFormat: opts.outputFormat,
       disc: { ...discIdentified, status: "remuxed" },
       titles: titlesAfter,
       runId,
@@ -535,6 +617,7 @@ async function runTvPipeline(ctx: StageCtx): Promise<number> {
     const remuxResult = await remuxTvEpisodes({
       db,
       outDir: cfg.outDir,
+      outputFormat: opts.outputFormat,
       makemkvcon,
       discRoot,
       disc: persisted.disc,
@@ -559,6 +642,7 @@ async function runTvPipeline(ctx: StageCtx): Promise<number> {
     const { manifestPath } = finalize({
       db,
       outDir: cfg.outDir,
+      outputFormat: opts.outputFormat,
       disc: { ...persisted.disc, status: "remuxed" },
       titles: titlesAfter,
       runId: tvRunId,

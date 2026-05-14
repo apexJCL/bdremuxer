@@ -88,6 +88,7 @@ const titles: TitleRow[] = [
 describe("buildManifest (tv)", () => {
   const out = buildManifest({
     outDir: "/lib",
+    outputFormat: "plex",
     disc,
     titles,
     runId: 12,
