@@ -61,16 +61,31 @@ export class ClassifyError extends Error {}
 
 export function persistMediaKind(db: DB, disc: DiscRow, kind: MediaKind): DiscRow {
   const now = new Date().toISOString();
+  // When media_kind flips we also clear the opposite FK, otherwise the
+  // disc CHECK constraint blocks the update on a re-run that re-classifies.
   if (disc.media_kind !== kind) {
-    db.run(`UPDATE disc SET media_kind = ?, updated_at = ? WHERE id = ?`, [
-      kind,
-      now,
-      disc.id,
-    ]);
+    if (kind === "movie") {
+      db.run(
+        `UPDATE disc SET media_kind = 'movie', season_id = NULL, updated_at = ? WHERE id = ?`,
+        [now, disc.id],
+      );
+    } else {
+      db.run(
+        `UPDATE disc SET media_kind = 'tv', movie_id = NULL, updated_at = ? WHERE id = ?`,
+        [now, disc.id],
+      );
+    }
   }
   db.run(`UPDATE disc SET status = 'classified', updated_at = ? WHERE id = ?`, [
     now,
     disc.id,
   ]);
-  return { ...disc, media_kind: kind, status: "classified", updated_at: now };
+  return {
+    ...disc,
+    media_kind: kind,
+    movie_id: kind === "movie" ? disc.movie_id : null,
+    season_id: kind === "tv" ? disc.season_id : null,
+    status: "classified",
+    updated_at: now,
+  };
 }

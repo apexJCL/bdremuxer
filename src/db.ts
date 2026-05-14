@@ -68,6 +68,35 @@ export type TrackRow = {
   flags: string | null;
 };
 
+export type TvShowRow = {
+  id: number;
+  tmdb_id: number | null;
+  imdb_id: string | null;
+  name: string;
+  first_air_year: number | null;
+  raw_response: string | null;
+};
+
+export type EpisodeOrder = "broadcast" | "production" | "dvd";
+
+export type SeasonRow = {
+  id: number;
+  tv_show_id: number;
+  season_number: number;
+  episode_order: EpisodeOrder;
+  raw_response: string | null;
+};
+
+export type EpisodeRow = {
+  id: number;
+  season_id: number;
+  episode_number: number;
+  name: string | null;
+  runtime_min: number | null;
+  air_date: string | null;
+  raw_response: string | null;
+};
+
 // title.role is left nullable until §5.5 (select); spec §8 has it NOT NULL
 // but the probe stage in §5.2 persists titles before selection runs. The
 // enum constraint still applies once a role is assigned.

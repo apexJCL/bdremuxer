@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 //
-// M3: scan → probe → classify → identify (movie) → select → remux → finalize.
-// Movie discs only; TV bounces with a "lands in M4" message.
+// M4: same as M3 for movies; TV discs go scan → probe → classify →
+// identify (TV) → select (TV) → print episode plan. No TV remux yet.
 
 import { parseArgs } from "node:util";
 import { statSync } from "node:fs";
@@ -14,7 +14,7 @@ import { CINFO } from "./makemkv/codes.ts";
 
 import { loadConfig } from "./config.ts";
 import { openDb } from "./db.ts";
-import type { DiscRow, MovieRow, TitleRow } from "./db.ts";
+import type { DiscRow, EpisodeOrder, MovieRow, TitleRow } from "./db.ts";
 
 import { scan } from "./pipeline/scan.ts";
 import { persistProbe } from "./pipeline/probe.ts";
@@ -24,8 +24,15 @@ import {
   identifyMovie,
   persistMovie,
 } from "./pipeline/identify/movie.ts";
+import {
+  AmbiguousTvMatchError,
+  identifyTv,
+  persistTvIdentification,
+} from "./pipeline/identify/tv.ts";
 import { persistMovieSelection, selectMovie } from "./pipeline/select/movie.ts";
 import type { MovieSelection } from "./pipeline/select/movie.ts";
+import { persistTvSelection, selectTv } from "./pipeline/select/tv.ts";
+import type { TvSelection } from "./pipeline/select/tv.ts";
 import { remuxMovieMain } from "./pipeline/remux.ts";
 import { finalize } from "./pipeline/finalize.ts";
 import {
@@ -39,19 +46,29 @@ import { formatHms, parseDurationFlag } from "./parse/duration.ts";
 
 import { version as PKG_VERSION } from "../package.json";
 
-const HELP = `bdremuxer (M3)
+const HELP = `bdremuxer (M4)
 
 Usage:
   bdremuxer <BDMV path> [options]
 
-Identification:
-  --type movie|tv          override auto-classification (M3 only handles 'movie')
+Identification (movie):
   --title "Name (Year)"    search query hint
   --tmdb-id N              skip search, fetch this TMDB id directly
   --imdb-id ttN            skip search, look up by IMDb id
 
+Identification (tv):
+  --show "Name (Year)"     search query hint for the show
+  --tmdb-show-id N         skip show search, fetch this TMDB show id directly
+  --season N               season number (required for TV if not parseable from path)
+  --starting-episode N     first episode number on this disc (default: 1)
+  --episode-order broadcast|production|dvd
+                           (M4: only broadcast is implemented; others fall back)
+
+Classification:
+  --type movie|tv|auto     default: auto
+
 Selection:
-  --include-extras                       (kept off in M3; main feature only)
+  --include-extras
   --min-length-skip <N>(s|m|h) | false   default: 90s
 
 Paths / behaviour:
@@ -62,6 +79,9 @@ Paths / behaviour:
   --force                  re-run remux even if disc.status='done'
   -v, --verbose
   -h, --help
+
+Note: M4 only remuxes movie discs. TV discs stop after the identify/select
+plan; TV remux lands in M5.
 
 Environment:
   BDREMUXER_TMDB_API_KEY   required for identification
@@ -79,6 +99,11 @@ async function main(argv: string[]): Promise<number> {
         title: { type: "string" },
         "tmdb-id": { type: "string" },
         "imdb-id": { type: "string" },
+        show: { type: "string" },
+        "tmdb-show-id": { type: "string" },
+        season: { type: "string" },
+        "starting-episode": { type: "string" },
+        "episode-order": { type: "string" },
         "include-extras": { type: "boolean" },
         "min-length-skip": { type: "string" },
         out: { type: "string" },
@@ -209,8 +234,70 @@ async function main(argv: string[]): Promise<number> {
     log(`classified: ${kind}`);
 
     if (kind === "tv") {
-      process.stderr.write("TV box-set support arrives in M4.\n");
-      return 1;
+      const episodeOrder = parseEpisodeOrderFlag(values["episode-order"]);
+      if (episodeOrder instanceof Error) {
+        process.stderr.write(`${episodeOrder.message}\n`);
+        return 2;
+      }
+      const seasonFlag = parseIntFlag(values.season);
+      const startingEpisode = parseIntFlag(values["starting-episode"]) ?? 1;
+
+      const tmdb = new TmdbClient({ apiKey: cfg.tmdbApiKey });
+      let tvIdentified;
+      try {
+        tvIdentified = await identifyTv({
+          client: tmdb,
+          tmdbShowId: parseIntFlag(values["tmdb-show-id"]),
+          showHint: values.show,
+          seasonFlag,
+          episodeOrder,
+          volumeLabel: scanRes.volumeLabel,
+          parentDirName,
+        });
+      } catch (e) {
+        if (e instanceof AmbiguousTvMatchError) {
+          process.stderr.write(`${e.message}\n\nCandidates:\n`);
+          for (const c of e.candidates) {
+            const year = c.first_air_date?.slice(0, 4) ?? "????";
+            process.stderr.write(
+              `  TMDB:${c.id}  ${c.name} (${year})  pop=${c.popularity.toFixed(1)}\n`,
+            );
+          }
+          return 1;
+        }
+        throw e;
+      }
+      const persisted = persistTvIdentification(db, discClassified, tvIdentified);
+      log(
+        `identified: show=tmdb:${tvIdentified.show.id} season=${tvIdentified.season.season_number} ` +
+          `(${tvIdentified.effectiveEpisodeOrder} order, season via ${tvIdentified.seasonSource}) ` +
+          `episodes=${persisted.episodes.length}`,
+      );
+
+      const tvSelection = selectTv({
+        titles: titleRows,
+        episodes: persisted.episodes,
+        minLengthSkipS,
+        startingEpisode,
+        includeExtras: !!values["include-extras"],
+      });
+      persistTvSelection(db, persisted.disc.id, tvSelection);
+      log(
+        `selected: ${tvSelection.episodeMap.length} episodes` +
+          (tvSelection.cohort.outlierIncluded ? " (incl. outlier)" : ""),
+      );
+
+      printTvPlan({
+        disc: persisted.disc,
+        show: tvIdentified.show,
+        seasonNumber: tvIdentified.season.season_number,
+        effectiveEpisodeOrder: tvIdentified.effectiveEpisodeOrder,
+        selection: tvSelection,
+        source: tvIdentified.source,
+        seasonSource: tvIdentified.seasonSource,
+        probe,
+      });
+      return 0;
     }
 
     // §5.4 Identify (movie)
@@ -403,6 +490,78 @@ function printPlan(p: PlanInput): void {
   if (p.dryRun) w("\nDry run — no remux performed.\n");
 }
 
+function printTvPlan(p: {
+  disc: DiscRow;
+  show: { id: number; name: string; imdb_id: string | null };
+  seasonNumber: number;
+  effectiveEpisodeOrder: EpisodeOrder;
+  selection: TvSelection;
+  source: string;
+  seasonSource: "flag" | "parsed";
+  probe: RobotProbe;
+}): void {
+  const w = (s: string) => process.stdout.write(s);
+  const discName =
+    p.probe.disc.get(CINFO.NAME) ??
+    p.probe.disc.get(CINFO.VOLUME_NAME) ??
+    p.disc.volume_label ??
+    "(unknown)";
+
+  w(`Disc: ${discName}\n`);
+  w(`  fingerprint: ${p.disc.fingerprint.slice(0, 12)}…\n`);
+  w(`  kind:        tv\n`);
+  w(`  status:      ${p.disc.status}\n`);
+  w("\n");
+
+  w(`Proposed show  (via ${p.source}):\n`);
+  w(`  ${p.show.name}\n`);
+  w(`  TMDB:    ${p.show.id}\n`);
+  w(`  IMDb:    ${p.show.imdb_id ?? "-"}\n`);
+  w(
+    `  Season:  ${p.seasonNumber} (${p.effectiveEpisodeOrder} order, source: ${p.seasonSource})\n`,
+  );
+  w(
+    `  Cohort:  ${p.selection.cohort.count} titles, median ${formatHms(p.selection.cohort.median)}` +
+      `, relStdev ${(p.selection.cohort.relStdev * 100).toFixed(1)}%` +
+      (p.selection.cohort.outlierIncluded
+        ? ` (incl. outlier #${p.selection.cohort.outlierIncluded.makemkv_id})`
+        : "") +
+      "\n",
+  );
+  w("\n");
+
+  w("Episode mapping:\n");
+  for (const { title, episode } of p.selection.episodeMap) {
+    const epNumStr = episode.episode_number.toString().padStart(2, "0");
+    const seasonStr = p.seasonNumber.toString().padStart(2, "0");
+    const titleStr = title.makemkv_id.toString().padStart(2, "0");
+    const epName = episode.name ?? `Episode ${epNumStr}`;
+    w(
+      `  S${seasonStr}E${epNumStr}  #${titleStr}  ${formatHms(title.duration_s)}  ${epName}\n`,
+    );
+  }
+
+  if (p.selection.extras.length > 0) {
+    w(`\nExtras (${p.selection.extras.length}):\n`);
+    for (const t of p.selection.extras) {
+      w(
+        `  #${t.makemkv_id.toString().padStart(2, "0")}  ${formatHms(t.duration_s)}  ${(t.size_bytes / 1e9).toFixed(2)} GB\n`,
+      );
+    }
+  }
+
+  if (p.selection.skipped.length > 0) {
+    w(`\nSkipped (${p.selection.skipped.length}):\n`);
+    for (const { title, reason } of p.selection.skipped) {
+      w(
+        `  #${title.makemkv_id.toString().padStart(2, "0")}  ${formatHms(title.duration_s)}  ${reason}\n`,
+      );
+    }
+  }
+
+  w("\nTV remux lands in M5 — plan only.\n");
+}
+
 function printTitleLine(probe: RobotProbe, t: TitleRow): void {
   const w = (s: string) => process.stdout.write(s);
   const info: TitleInfo | undefined = probe.titles.get(t.makemkv_id);
@@ -480,6 +639,14 @@ function parseIntFlag(raw: string | undefined): number | undefined {
   const n = Number(raw);
   if (!Number.isFinite(n)) throw new Error(`Expected integer, got "${raw}"`);
   return n;
+}
+
+function parseEpisodeOrderFlag(raw: string | undefined): EpisodeOrder | Error {
+  if (raw === undefined) return "broadcast";
+  if (raw === "broadcast" || raw === "production" || raw === "dvd") return raw;
+  return new Error(
+    `--episode-order must be one of broadcast|production|dvd (got "${raw}")`,
+  );
 }
 
 const exit = await main(Bun.argv.slice(2));
