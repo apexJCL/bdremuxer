@@ -1,10 +1,19 @@
-// Plex-style movie layout (§4.1).
+// Plex-style movie / TV layouts (§4.1, §4.2).
 //
+// Movie:
 //   <out>/<Title> (<Year>) [imdbid-tt…]/
 //     └── <Title> (<Year>).mkv
 //
+// TV:
+//   <out>/<Show> (<Year>) [tmdbid-N]/
+//     └── Season 02/
+//           ├── <Show> - S02E01 - <Episode>.mkv
+//           └── extras/
+//
 // The [imdbid-…] suffix is preferred; falls back to [tmdbid-N]; falls back
-// to no tag if neither external id is known (§4.4).
+// to no tag if neither external id is known (§4.4). Multi-disc seasons
+// produce overlapping `Season NN/` directories across separate runs —
+// each disc writes its own episode files into the shared folder.
 
 import { join } from "node:path";
 
@@ -35,9 +44,9 @@ export function plexMoviePaths(outDir: string, m: MovieIdentity): MoviePaths {
   };
 }
 
-function formatIdTag(m: MovieIdentity): string {
-  if (m.imdb_id) return ` [imdbid-${m.imdb_id}]`;
-  if (m.tmdb_id != null) return ` [tmdbid-${m.tmdb_id}]`;
+function formatIdTag(ids: { imdb_id: string | null; tmdb_id: number | null }): string {
+  if (ids.imdb_id) return ` [imdbid-${ids.imdb_id}]`;
+  if (ids.tmdb_id != null) return ` [tmdbid-${ids.tmdb_id}]`;
   return "";
 }
 
@@ -57,4 +66,54 @@ export function sanitizeForPath(s: string): string {
     .replace(/\s+/g, " ")
     .replace(/^\.+|\.+$/g, "")
     .trim();
+}
+
+// -----------------------------------------------------------------------
+// TV (§4.2)
+// -----------------------------------------------------------------------
+
+export type TvIdentity = {
+  showName: string;
+  firstAirYear: number | null;
+  imdb_id: string | null;
+  tmdb_id: number | null;
+};
+
+export type EpisodeIdentity = {
+  seasonNumber: number;
+  episodeNumber: number;
+  episodeName: string | null;
+};
+
+export type TvPaths = {
+  showFolder: string;    // <out>/Show (Year) [imdbid-…]
+  seasonFolder: string;  // .../Season 02
+  episodeMkv: string;    // .../Show - S02E01 - Pilot.mkv
+  extrasDir: string;     // .../Season 02/extras
+};
+
+export function plexTvPaths(
+  outDir: string,
+  show: TvIdentity,
+  ep: EpisodeIdentity,
+): TvPaths {
+  const safeShow = sanitizeForPath(show.showName);
+  const yearPart = show.firstAirYear ? ` (${show.firstAirYear})` : "";
+  const idTag = formatIdTag({ imdb_id: show.imdb_id, tmdb_id: show.tmdb_id });
+
+  const showFolder = join(outDir, `${safeShow}${yearPart}${idTag}`);
+  const seasonStr = ep.seasonNumber.toString().padStart(2, "0");
+  const seasonFolder = join(showFolder, `Season ${seasonStr}`);
+
+  const epNumStr = ep.episodeNumber.toString().padStart(2, "0");
+  const epName = ep.episodeName?.trim() || `Episode ${epNumStr}`;
+  const safeEpName = sanitizeForPath(epName);
+  const fileName = `${safeShow} - S${seasonStr}E${epNumStr} - ${safeEpName}.mkv`;
+
+  return {
+    showFolder,
+    seasonFolder,
+    episodeMkv: join(seasonFolder, fileName),
+    extrasDir: join(seasonFolder, "extras"),
+  };
 }

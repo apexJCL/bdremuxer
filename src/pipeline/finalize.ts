@@ -3,25 +3,45 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import type { DB, DiscRow, MovieRow, TitleRow } from "../db.ts";
+import type {
+  DB,
+  DiscRow,
+  EpisodeRow,
+  MovieRow,
+  SeasonRow,
+  TitleRow,
+  TvShowRow,
+} from "../db.ts";
 import { finishRun } from "./run.ts";
 
-export type ManifestInput = {
+export type MovieManifestInput = {
+  kind: "movie";
+  movie: MovieRow;
+};
+
+export type TvManifestInput = {
+  kind: "tv";
+  show: TvShowRow;
+  season: SeasonRow;
+  episodes: EpisodeRow[];
+};
+
+export type FinalizeInput = {
   db: DB;
   outDir: string;
   disc: DiscRow;
-  movie: MovieRow;
-  titles: TitleRow[];      // every title from the disc (with role/output_path filled in)
+  titles: TitleRow[];      // every title row for the disc (with role/output_path filled in)
   runId: number;
   shortFp: string;
   bdremuxerVersion: string;
+  media: MovieManifestInput | TvManifestInput;
 };
 
 export type FinalizeResult = {
   manifestPath: string;
 };
 
-export function finalize(input: ManifestInput): FinalizeResult {
+export function finalize(input: FinalizeInput): FinalizeResult {
   const manifest = buildManifest(input);
 
   const manifestDir = join(input.outDir, ".bdremuxer", "manifests");
@@ -39,8 +59,8 @@ export function finalize(input: ManifestInput): FinalizeResult {
   return { manifestPath };
 }
 
-export function buildManifest(input: Omit<ManifestInput, "db">): unknown {
-  return {
+export function buildManifest(input: Omit<FinalizeInput, "db">): unknown {
+  const base: Record<string, unknown> = {
     version: 1,
     bdremuxer_version: input.bdremuxerVersion,
     run_id: input.runId,
@@ -51,20 +71,46 @@ export function buildManifest(input: Omit<ManifestInput, "db">): unknown {
       volume_label: input.disc.volume_label,
       media_kind: input.disc.media_kind,
     },
-    movie: {
-      tmdb_id: input.movie.tmdb_id,
-      imdb_id: input.movie.imdb_id,
-      title: input.movie.title,
-      year: input.movie.year,
-      runtime_min: input.movie.runtime_min,
-    },
     titles: input.titles.map((t) => ({
       makemkv_id: t.makemkv_id,
       duration_s: t.duration_s,
       size_bytes: t.size_bytes,
       segment_map: t.segment_map,
       role: t.role,
+      episode_id: t.episode_id,
       output_path: t.output_path,
     })),
   };
+
+  if (input.media.kind === "movie") {
+    const m = input.media.movie;
+    base.movie = {
+      tmdb_id: m.tmdb_id,
+      imdb_id: m.imdb_id,
+      title: m.title,
+      year: m.year,
+      runtime_min: m.runtime_min,
+    };
+    return base;
+  }
+
+  const { show, season, episodes } = input.media;
+  base.show = {
+    tmdb_id: show.tmdb_id,
+    imdb_id: show.imdb_id,
+    name: show.name,
+    first_air_year: show.first_air_year,
+  };
+  base.season = {
+    season_number: season.season_number,
+    episode_order: season.episode_order,
+  };
+  base.episodes = episodes.map((e) => ({
+    id: e.id,
+    episode_number: e.episode_number,
+    name: e.name,
+    runtime_min: e.runtime_min,
+    air_date: e.air_date,
+  }));
+  return base;
 }

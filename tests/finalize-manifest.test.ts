@@ -55,11 +55,11 @@ describe("buildManifest", () => {
   const out = buildManifest({
     outDir: "/out",
     disc,
-    movie,
     titles,
     runId: 7,
     shortFp: "abcdef012345",
     bdremuxerVersion: "0.0.1",
+    media: { kind: "movie", movie },
   }) as Record<string, unknown> & {
     disc: Record<string, unknown>;
     movie: Record<string, unknown>;

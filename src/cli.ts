@@ -33,7 +33,7 @@ import { persistMovieSelection, selectMovie } from "./pipeline/select/movie.ts";
 import type { MovieSelection } from "./pipeline/select/movie.ts";
 import { persistTvSelection, selectTv } from "./pipeline/select/tv.ts";
 import type { TvSelection } from "./pipeline/select/tv.ts";
-import { remuxMovieMain } from "./pipeline/remux.ts";
+import { remuxMovieMain, remuxTvEpisodes } from "./pipeline/remux.ts";
 import { finalize } from "./pipeline/finalize.ts";
 import {
   finishRun,
@@ -287,17 +287,77 @@ async function main(argv: string[]): Promise<number> {
           (tvSelection.cohort.outlierIncluded ? " (incl. outlier)" : ""),
       );
 
-      printTvPlan({
-        disc: persisted.disc,
-        show: tvIdentified.show,
-        seasonNumber: tvIdentified.season.season_number,
-        effectiveEpisodeOrder: tvIdentified.effectiveEpisodeOrder,
-        selection: tvSelection,
-        source: tvIdentified.source,
-        seasonSource: tvIdentified.seasonSource,
-        probe,
-      });
-      return 0;
+      // --dry-run: stop after select, print plan only.
+      if (values["dry-run"]) {
+        printTvPlan({
+          disc: persisted.disc,
+          show: tvIdentified.show,
+          seasonNumber: tvIdentified.season.season_number,
+          effectiveEpisodeOrder: tvIdentified.effectiveEpisodeOrder,
+          selection: tvSelection,
+          source: tvIdentified.source,
+          seasonSource: tvIdentified.seasonSource,
+          probe,
+          dryRun: true,
+        });
+        return 0;
+      }
+
+      // §5.6 Remux (TV) + §5.7 Finalize
+      const tvRunId = startRun(db, persisted.disc.id);
+      try {
+        const printer = makeTvProgressPrinter();
+        const remuxResult = await remuxTvEpisodes({
+          db,
+          outDir: cfg.outDir,
+          makemkvcon,
+          discRoot,
+          disc: persisted.disc,
+          show: persisted.show,
+          season: persisted.season,
+          episodeMap: tvSelection.episodeMap,
+          runId: tvRunId,
+          force: !!values.force,
+          shortFp,
+          onProgress: printer.onProgress,
+          onEpisodeDone: printer.onEpisodeDone,
+        });
+
+        const titlesAfter = db
+          .query<TitleRow, [number]>(
+            `SELECT * FROM title WHERE disc_id = ? ORDER BY makemkv_id`,
+          )
+          .all(persisted.disc.id);
+
+        const { manifestPath } = finalize({
+          db,
+          outDir: cfg.outDir,
+          disc: { ...persisted.disc, status: "remuxed" },
+          titles: titlesAfter,
+          runId: tvRunId,
+          shortFp,
+          bdremuxerVersion: PKG_VERSION,
+          media: {
+            kind: "tv",
+            show: persisted.show,
+            season: persisted.season,
+            episodes: persisted.episodes,
+          },
+        });
+
+        printTvDone({
+          show: persisted.show,
+          seasonNumber: persisted.season.season_number,
+          outputs: remuxResult.outputs,
+          manifestPath,
+          logPath: remuxResult.logPath,
+        });
+        return 0;
+      } catch (e) {
+        finishRun(db, tvRunId, false);
+        markDiscFailed(db, persisted.disc.id, "remuxed");
+        throw e;
+      }
     }
 
     // §5.4 Identify (movie)
@@ -385,11 +445,11 @@ async function main(argv: string[]): Promise<number> {
         db,
         outDir: cfg.outDir,
         disc: { ...discIdentified, status: "remuxed" },
-        movie,
         titles: titlesAfter,
         runId,
         shortFp,
         bdremuxerVersion: PKG_VERSION,
+        media: { kind: "movie", movie },
       });
 
       printDone({
@@ -427,6 +487,34 @@ function makeProgressPrinter(): (frac: number, task?: string) => void {
     const bar = renderBar(frac);
     const label = task ? ` ${task}` : "";
     process.stderr.write(`\rRemux: ${bar} ${pct.toString().padStart(3)}%${label}   `);
+  };
+}
+
+function makeTvProgressPrinter(): {
+  onProgress: (epIdx: number, epTotal: number, frac: number, task?: string) => void;
+  onEpisodeDone: (epIdx: number, epTotal: number, skipped: boolean) => void;
+} {
+  let lastKey = "";
+  return {
+    onProgress: (epIdx, epTotal, frac, task) => {
+      const pct = Math.floor(frac * 100);
+      const key = `${epIdx}-${pct}-${task ?? ""}`;
+      if (key === lastKey) return;
+      lastKey = key;
+      const bar = renderBar(frac);
+      const label = task ? ` ${task}` : "";
+      process.stderr.write(
+        `\rEp ${epIdx}/${epTotal}: ${bar} ${pct.toString().padStart(3)}%${label}   `,
+      );
+    },
+    onEpisodeDone: (epIdx, epTotal, skipped) => {
+      if (skipped) {
+        process.stderr.write(`Ep ${epIdx}/${epTotal}: already on disk, skipped\n`);
+      } else {
+        process.stderr.write("\n");
+      }
+      lastKey = "";
+    },
   };
 }
 
@@ -499,6 +587,7 @@ function printTvPlan(p: {
   source: string;
   seasonSource: "flag" | "parsed";
   probe: RobotProbe;
+  dryRun?: boolean;
 }): void {
   const w = (s: string) => process.stdout.write(s);
   const discName =
@@ -559,7 +648,35 @@ function printTvPlan(p: {
     }
   }
 
-  w("\nTV remux lands in M5 — plan only.\n");
+  if (p.dryRun) w("\nDry run — no remux performed.\n");
+}
+
+function printTvDone(p: {
+  show: { name: string; first_air_year: number | null };
+  seasonNumber: number;
+  outputs: Array<{
+    title: TitleRow;
+    episode: { episode_number: number; name: string | null };
+    outputPath: string;
+    skipped: boolean;
+  }>;
+  manifestPath: string;
+  logPath: string;
+}): void {
+  const w = (s: string) => process.stdout.write(s);
+  const seasonStr = p.seasonNumber.toString().padStart(2, "0");
+  const yearPart = p.show.first_air_year ? ` (${p.show.first_air_year})` : "";
+  const skippedCount = p.outputs.filter((o) => o.skipped).length;
+  const remuxedCount = p.outputs.length - skippedCount;
+
+  w(`\n${p.show.name}${yearPart} — Season ${seasonStr}\n`);
+  w(`  Episodes remuxed: ${remuxedCount}${skippedCount ? `, skipped: ${skippedCount}` : ""}\n`);
+  for (const o of p.outputs) {
+    const tag = o.skipped ? " [skipped]" : "";
+    w(`  S${seasonStr}E${o.episode.episode_number.toString().padStart(2, "0")}  ${o.outputPath}${tag}\n`);
+  }
+  w(`  Manifest: ${p.manifestPath}\n`);
+  w(`  Log:      ${p.logPath}\n`);
 }
 
 function printTitleLine(probe: RobotProbe, t: TitleRow): void {
