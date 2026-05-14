@@ -602,8 +602,17 @@ cost is small (~50 KB into the standalone binary).
    per-disc `bdremuxer.toml` sidecars AND top-level
    `bdremuxer.batch.toml` glob blocks, `--output-format=flat`,
    `--continue-on-error`.
-9. **M9 — Polish.** OMDb fallback, JSON progress mode, GH Actions
-   release workflow producing the macOS arm64 binary, README.
+9. **M9 — Polish.** OMDb fallback (TMDB-empty + `--imdb-id` not-found
+   both bridge through OMDb's `?t=` / `?i=` endpoints, with a
+   try-back-to-TMDB step when OMDb gives us an IMDb id); `--json` mode
+   emitting NDJSON events on stdout (`plan`, `progress`, `title_done`,
+   `done`, `error`, `ambiguous_match`, `batch_*`); README quick-start.
+10. **M10 — Release workflow.** GitHub Actions job that builds the
+    macOS arm64 standalone binary via `bun build --compile`, runs
+    `bun test` + `tsc --noEmit` in CI, and attaches the binary to a
+    GitHub Release on tag push (`v*`). Verifies the release binary
+    runs `--version` cleanly before publishing. (Homebrew tap stays
+    out of scope; can be added later from the release artefact.)
 
 ## 13. Open questions
 
@@ -625,7 +634,7 @@ the body):
   `Ns|Nm|Nh` or `false` (keep everything).
 - ✅ **Q7 Compile targets.** macOS arm64 only for v1.
 - ✅ **Q8 Distribution.** GitHub Releases with standalone binary attached
-  (deferred to M8; Homebrew tap later).
+  (lands in M10; Homebrew tap later).
 - ✅ **Q9 Auto-classify confidence.** Require explicit `--type` when the
   heuristic is unsure rather than guessing. (§5.3)
 - ✅ **Q10 Episode cohort tolerance.** Pull in a single outlier within
