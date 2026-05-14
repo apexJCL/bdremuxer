@@ -1,7 +1,6 @@
-// TMDB API client with the retry policy from spec §10:
-//   - retry on network errors, HTTP 5xx, HTTP 429 (honour Retry-After)
-//   - fail fast on other 4xx (auth, 404, bad request)
-//   - 3 tries with 1s/2s/4s backoff
+// TMDB API client. Retry / backoff policy lives in ./retry.ts.
+
+import { fetchJsonWithRetry } from "./retry.ts";
 
 const BASE = "https://api.themoviedb.org/3";
 
@@ -21,7 +20,8 @@ export type MovieSearchResult = {
 };
 
 export type MovieDetails = {
-  id: number;
+  /** TMDB id. Null when this row was sourced from OMDb only. */
+  id: number | null;
   title: string;
   original_title: string;
   release_date: string | null;
@@ -174,56 +174,11 @@ export class TmdbClient {
     return this.getMovie(first.id);
   }
 
-  private async get<T>(pathQ: string): Promise<T> {
-    const maxTries = this.cfg.maxTries ?? 3;
-    let lastErr: unknown;
-    for (let attempt = 1; attempt <= maxTries; attempt++) {
-      try {
-        let res: Response;
-        try {
-          res = await fetch(`${BASE}${pathQ}`);
-        } catch (e) {
-          throw new RetryableError(
-            `TMDB network error: ${(e as Error).message}`,
-            backoffMs(attempt),
-          );
-        }
-        if (res.ok) return (await res.json()) as T;
-        if (res.status === 429) {
-          const retryAfter = Number(res.headers.get("Retry-After"));
-          const delay = Number.isFinite(retryAfter) && retryAfter > 0
-            ? retryAfter * 1000
-            : backoffMs(attempt);
-          throw new RetryableError(`TMDB 429 rate-limited`, delay);
-        }
-        if (res.status >= 500) {
-          throw new RetryableError(`TMDB ${res.status}`, backoffMs(attempt));
-        }
-        const body = await res.text().catch(() => "");
-        throw new Error(`TMDB ${res.status} ${res.statusText}: ${body.slice(0, 200)}`);
-      } catch (e) {
-        lastErr = e;
-        if (e instanceof RetryableError && attempt < maxTries) {
-          await sleep(e.delayMs);
-          continue;
-        }
-        throw e;
-      }
-    }
-    throw lastErr;
+  private get<T>(pathQ: string): Promise<T> {
+    return fetchJsonWithRetry<T>({
+      url: `${BASE}${pathQ}`,
+      maxTries: this.cfg.maxTries ?? 3,
+      service: "TMDB",
+    });
   }
-}
-
-class RetryableError extends Error {
-  constructor(message: string, readonly delayMs: number) {
-    super(message);
-  }
-}
-
-function backoffMs(attempt: number): number {
-  return 1000 * 2 ** (attempt - 1);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }

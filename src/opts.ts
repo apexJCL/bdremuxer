@@ -23,5 +23,6 @@ export type CliOpts = {
   outputFormat: OutputFormat;
   dryRun?: boolean;
   force?: boolean;
+  json?: boolean;
   verbose?: boolean;
 };

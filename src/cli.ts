@@ -53,6 +53,7 @@ import {
   startRun,
 } from "./pipeline/run.ts";
 import { TmdbClient } from "./metadata/tmdb.ts";
+import { OmdbClient } from "./metadata/omdb.ts";
 
 import { formatHms, parseDurationFlag } from "./parse/duration.ts";
 
@@ -68,6 +69,20 @@ function parseIntArg(value: string): number {
     throw new InvalidArgumentError(`Expected an integer, got "${value}".`);
   }
   return n;
+}
+
+// -----------------------------------------------------------------------
+// JSON event emission (--json mode)
+// -----------------------------------------------------------------------
+// Pure NDJSON on stdout. Each line is one event with a `kind` discriminator
+// and an ISO timestamp; arbitrary additional fields per event type. Errors
+// also flow through here (rather than stderr) so a consumer reading stdout
+// gets the full lifecycle.
+
+function emitJson(kind: string, data: Record<string, unknown>): void {
+  process.stdout.write(
+    JSON.stringify({ ts: new Date().toISOString(), kind, ...data }) + "\n",
+  );
 }
 
 // -----------------------------------------------------------------------
@@ -135,6 +150,7 @@ function addPipelineOptions(cmd: Command): Command {
   );
   cmd.option("--dry-run", "stop after select; print plan only (no remux)");
   cmd.option("--force", "re-probe and re-remux even if cached / done");
+  cmd.option("--json", "emit NDJSON events on stdout instead of human-readable text");
   cmd.option("-v, --verbose", "extra logging on stderr");
 
   return cmd;
@@ -213,7 +229,7 @@ async function runPipeline(bdmvArg: string, opts: CliOpts): Promise<number> {
   const discRoot = normalizeDiscRoot(bdmvArg);
   const validation = validateBdmv(discRoot);
   if (!validation.ok) {
-    process.stderr.write(`${validation.error}\n`);
+    reportError(opts, validation.error);
     return 1;
   }
 
@@ -221,15 +237,13 @@ async function runPipeline(bdmvArg: string, opts: CliOpts): Promise<number> {
   try {
     minLengthSkipS = parseDurationFlag(opts.minLengthSkip);
   } catch (e) {
-    process.stderr.write(`${(e as Error).message}\n`);
+    reportError(opts, (e as Error).message);
     return 2;
   }
 
   const cfg = loadConfig({ outDir: opts.out, dbPath: opts.db });
   if (!cfg.tmdbApiKey) {
-    process.stderr.write(
-      "BDREMUXER_TMDB_API_KEY is required for identification.\n",
-    );
+    reportError(opts, "BDREMUXER_TMDB_API_KEY is required for identification.");
     return 1;
   }
 
@@ -237,7 +251,7 @@ async function runPipeline(bdmvArg: string, opts: CliOpts): Promise<number> {
   try {
     makemkvcon = discoverMakemkvcon({ override: opts.makemkvcon });
   } catch (e) {
-    process.stderr.write(`${(e as Error).message}\n`);
+    reportError(opts, (e as Error).message);
     return 1;
   }
 
@@ -268,11 +282,18 @@ async function runPipeline(bdmvArg: string, opts: CliOpts): Promise<number> {
           `SELECT output_path FROM title WHERE disc_id = ? AND role = 'main'`,
         )
         .get(scanRes.disc.id);
-      process.stdout.write(
-        `Disc already processed (status=done).\n` +
-          (existing?.output_path ? `  Output: ${existing.output_path}\n` : "") +
-          `  Pass --force to re-run.\n`,
-      );
+      if (opts.json) {
+        emitJson("already_done", {
+          fingerprint: scanRes.fingerprint,
+          output_path: existing?.output_path ?? null,
+        });
+      } else {
+        process.stdout.write(
+          `Disc already processed (status=done).\n` +
+            (existing?.output_path ? `  Output: ${existing.output_path}\n` : "") +
+            `  Pass --force to re-run.\n`,
+        );
+      }
       return 0;
     }
 
@@ -310,7 +331,7 @@ async function runPipeline(bdmvArg: string, opts: CliOpts): Promise<number> {
       });
     } catch (e) {
       if (e instanceof ClassifyError) {
-        process.stderr.write(`${e.message}\n`);
+        reportError(opts, e.message, "classify");
         return 1;
       }
       throw e;
@@ -349,11 +370,20 @@ async function runPipeline(bdmvArg: string, opts: CliOpts): Promise<number> {
       log,
     });
   } catch (e) {
-    process.stderr.write(`Error: ${(e as Error).message}\n`);
+    reportError(opts, (e as Error).message);
     return 1;
   } finally {
     db.close();
   }
+}
+
+function reportError(
+  opts: { json?: boolean },
+  message: string,
+  stage?: string,
+): void {
+  if (opts.json) emitJson("error", { message, stage: stage ?? null });
+  else process.stderr.write(`${message}\n`);
 }
 
 // -----------------------------------------------------------------------
@@ -369,22 +399,28 @@ async function runBatch(
     parentAbs = resolve(parentDir);
     const st = statSync(parentAbs);
     if (!st.isDirectory()) {
-      process.stderr.write(`Not a directory: ${parentAbs}\n`);
+      reportError(opts, `Not a directory: ${parentAbs}`);
       return 1;
     }
   } catch {
-    process.stderr.write(`Path does not exist: ${parentDir}\n`);
+    reportError(opts, `Path does not exist: ${parentDir}`);
     return 1;
   }
 
   const discs = walkBdmvFolders(parentAbs);
   if (discs.length === 0) {
-    process.stderr.write(`No BDMV folders found under ${parentAbs}\n`);
+    reportError(opts, `No BDMV folders found under ${parentAbs}`);
     return 1;
   }
 
   const batchBlocks = loadBatchOverrides(parentAbs);
-  if (opts.verbose) {
+  if (opts.json) {
+    emitJson("batch_start", {
+      parent_dir: parentAbs,
+      disc_count: discs.length,
+      batch_toml_blocks: batchBlocks.length,
+    });
+  } else if (opts.verbose) {
     process.stderr.write(
       `[bdremuxer] batch: ${discs.length} discs under ${parentAbs}\n` +
         (batchBlocks.length > 0
@@ -403,26 +439,44 @@ async function runBatch(
       batchBlocks,
     });
 
-    process.stderr.write(
-      `\n=== Disc ${i + 1}/${discs.length}: ${disc.relPath} ===\n`,
-    );
+    if (opts.json) {
+      emitJson("batch_disc_start", {
+        idx: i + 1,
+        total: discs.length,
+        rel_path: disc.relPath,
+      });
+    } else {
+      process.stderr.write(
+        `\n=== Disc ${i + 1}/${discs.length}: ${disc.relPath} ===\n`,
+      );
+    }
     const code = await runPipeline(disc.absPath, effectiveOpts);
     results.push({ relPath: disc.relPath, code });
     if (code !== 0 && !opts.continueOnError) {
-      process.stderr.write(
-        `\nDisc failed (exit ${code}); stopping. Pass --continue-on-error to keep going.\n`,
-      );
+      if (!opts.json) {
+        process.stderr.write(
+          `\nDisc failed (exit ${code}); stopping. Pass --continue-on-error to keep going.\n`,
+        );
+      }
       break;
     }
   }
 
   const ok = results.filter((r) => r.code === 0).length;
   const failed = results.filter((r) => r.code !== 0);
-  process.stderr.write(
-    `\n=== Batch summary ===\n  ${ok}/${results.length} disc(s) ok\n`,
-  );
-  for (const r of failed) {
-    process.stderr.write(`  FAILED: ${r.relPath} (exit ${r.code})\n`);
+  if (opts.json) {
+    emitJson("batch_summary", {
+      ok,
+      total: results.length,
+      failed: failed.map((r) => ({ rel_path: r.relPath, code: r.code })),
+    });
+  } else {
+    process.stderr.write(
+      `\n=== Batch summary ===\n  ${ok}/${results.length} disc(s) ok\n`,
+    );
+    for (const r of failed) {
+      process.stderr.write(`  FAILED: ${r.relPath} (exit ${r.code})\n`);
+    }
   }
   return failed.length > 0 ? 1 : 0;
 }
@@ -447,10 +501,14 @@ async function runMoviePipeline(ctx: StageCtx): Promise<number> {
 
   log("identify (TMDB)...");
   const client = new TmdbClient({ apiKey: cfg.tmdbApiKey! });
+  const omdbClient = cfg.omdbApiKey
+    ? new OmdbClient({ apiKey: cfg.omdbApiKey })
+    : null;
   let identified;
   try {
     identified = await identifyMovie({
       client,
+      omdbClient,
       tmdbId: opts.tmdbId,
       imdbId: opts.imdbId,
       titleHint: opts.title,
@@ -459,12 +517,24 @@ async function runMoviePipeline(ctx: StageCtx): Promise<number> {
     });
   } catch (e) {
     if (e instanceof AmbiguousMatchError) {
-      process.stderr.write(`${e.message}\n\nCandidates:\n`);
-      for (const c of e.candidates) {
-        const year = c.release_date?.slice(0, 4) ?? "????";
-        process.stderr.write(
-          `  TMDB:${c.id}  ${c.title} (${year})  pop=${c.popularity.toFixed(1)}\n`,
-        );
+      if (opts.json) {
+        emitJson("ambiguous_match", {
+          kind: "movie",
+          candidates: e.candidates.map((c) => ({
+            tmdb_id: c.id,
+            title: c.title,
+            year: c.release_date?.slice(0, 4) ?? null,
+            popularity: c.popularity,
+          })),
+        });
+      } else {
+        process.stderr.write(`${e.message}\n\nCandidates:\n`);
+        for (const c of e.candidates) {
+          const year = c.release_date?.slice(0, 4) ?? "????";
+          process.stderr.write(
+            `  TMDB:${c.id}  ${c.title} (${year})  pop=${c.popularity.toFixed(1)}\n`,
+          );
+        }
       }
       return 1;
     }
@@ -483,20 +553,14 @@ async function runMoviePipeline(ctx: StageCtx): Promise<number> {
   log("selected");
 
   if (opts.dryRun) {
-    printPlan({
-      db,
-      disc: discIdentified,
-      movie,
-      selection,
-      source: identified.source,
-      dryRun: true,
-    });
+    if (opts.json) emitJson("plan", buildMoviePlanEvent(discIdentified, movie, selection, identified.source));
+    else printPlan({ db, disc: discIdentified, movie, selection, source: identified.source, dryRun: true });
     return 0;
   }
 
   const runId = startRun(db, discIdentified.id);
   try {
-    const printer = makeMovieProgressPrinter();
+    const printer = makeMovieProgressPrinter(!!opts.json);
     const remuxResult = await remuxMovieMain({
       db,
       outDir: cfg.outDir,
@@ -533,13 +597,24 @@ async function runMoviePipeline(ctx: StageCtx): Promise<number> {
       media: { kind: "movie", movie },
     });
 
-    printDone({
-      movie,
-      main: remuxResult.main,
-      extras: remuxResult.extras,
-      manifestPath,
-      logPath: remuxResult.logPath,
-    });
+    if (opts.json) {
+      emitJson("done", {
+        media_kind: "movie",
+        movie: { tmdb_id: movie.tmdb_id, imdb_id: movie.imdb_id, title: movie.title, year: movie.year },
+        main: { output_path: remuxResult.main.outputPath, skipped: remuxResult.main.skipped },
+        extras: remuxResult.extras.map((e) => ({ output_path: e.outputPath, skipped: e.skipped })),
+        manifest_path: manifestPath,
+        log_path: remuxResult.logPath,
+      });
+    } else {
+      printDone({
+        movie,
+        main: remuxResult.main,
+        extras: remuxResult.extras,
+        manifestPath,
+        logPath: remuxResult.logPath,
+      });
+    }
     return 0;
   } catch (e) {
     finishRun(db, runId, false);
@@ -565,12 +640,24 @@ async function runTvPipeline(ctx: StageCtx): Promise<number> {
     });
   } catch (e) {
     if (e instanceof AmbiguousTvMatchError) {
-      process.stderr.write(`${e.message}\n\nCandidates:\n`);
-      for (const c of e.candidates) {
-        const year = c.first_air_date?.slice(0, 4) ?? "????";
-        process.stderr.write(
-          `  TMDB:${c.id}  ${c.name} (${year})  pop=${c.popularity.toFixed(1)}\n`,
-        );
+      if (opts.json) {
+        emitJson("ambiguous_match", {
+          kind: "tv",
+          candidates: e.candidates.map((c) => ({
+            tmdb_id: c.id,
+            name: c.name,
+            year: c.first_air_date?.slice(0, 4) ?? null,
+            popularity: c.popularity,
+          })),
+        });
+      } else {
+        process.stderr.write(`${e.message}\n\nCandidates:\n`);
+        for (const c of e.candidates) {
+          const year = c.first_air_date?.slice(0, 4) ?? "????";
+          process.stderr.write(
+            `  TMDB:${c.id}  ${c.name} (${year})  pop=${c.popularity.toFixed(1)}\n`,
+          );
+        }
       }
       return 1;
     }
@@ -597,23 +684,38 @@ async function runTvPipeline(ctx: StageCtx): Promise<number> {
   );
 
   if (opts.dryRun) {
-    printTvPlan({
-      db,
-      disc: persisted.disc,
-      show: tvIdentified.show,
-      seasonNumber: tvIdentified.season.season_number,
-      effectiveEpisodeOrder: tvIdentified.effectiveEpisodeOrder,
-      selection: tvSelection,
-      source: tvIdentified.source,
-      seasonSource: tvIdentified.seasonSource,
-      dryRun: true,
-    });
+    if (opts.json) {
+      emitJson(
+        "plan",
+        buildTvPlanEvent(
+          persisted.disc,
+          tvIdentified.show,
+          tvIdentified.season.season_number,
+          tvIdentified.effectiveEpisodeOrder,
+          tvSelection,
+          tvIdentified.source,
+          tvIdentified.seasonSource,
+        ),
+      );
+    } else {
+      printTvPlan({
+        db,
+        disc: persisted.disc,
+        show: tvIdentified.show,
+        seasonNumber: tvIdentified.season.season_number,
+        effectiveEpisodeOrder: tvIdentified.effectiveEpisodeOrder,
+        selection: tvSelection,
+        source: tvIdentified.source,
+        seasonSource: tvIdentified.seasonSource,
+        dryRun: true,
+      });
+    }
     return 0;
   }
 
   const tvRunId = startRun(db, persisted.disc.id);
   try {
-    const tvPrinter = makeTvProgressPrinter();
+    const tvPrinter = makeTvProgressPrinter(!!opts.json);
     const remuxResult = await remuxTvEpisodes({
       db,
       outDir: cfg.outDir,
@@ -656,14 +758,36 @@ async function runTvPipeline(ctx: StageCtx): Promise<number> {
       },
     });
 
-    printTvDone({
-      show: persisted.show,
-      seasonNumber: persisted.season.season_number,
-      episodes: remuxResult.episodes,
-      extras: remuxResult.extras,
-      manifestPath,
-      logPath: remuxResult.logPath,
-    });
+    if (opts.json) {
+      emitJson("done", {
+        media_kind: "tv",
+        show: {
+          tmdb_id: persisted.show.tmdb_id,
+          imdb_id: persisted.show.imdb_id,
+          name: persisted.show.name,
+          first_air_year: persisted.show.first_air_year,
+        },
+        season: { season_number: persisted.season.season_number },
+        episodes: remuxResult.episodes.map((o) => ({
+          episode_number: o.episode.episode_number,
+          name: o.episode.name,
+          output_path: o.outputPath,
+          skipped: o.skipped,
+        })),
+        extras: remuxResult.extras.map((e) => ({ output_path: e.outputPath, skipped: e.skipped })),
+        manifest_path: manifestPath,
+        log_path: remuxResult.logPath,
+      });
+    } else {
+      printTvDone({
+        show: persisted.show,
+        seasonNumber: persisted.season.season_number,
+        episodes: remuxResult.episodes,
+        extras: remuxResult.extras,
+        manifestPath,
+        logPath: remuxResult.logPath,
+      });
+    }
     return 0;
   } catch (e) {
     finishRun(db, tvRunId, false);
@@ -676,11 +800,29 @@ async function runTvPipeline(ctx: StageCtx): Promise<number> {
 // Progress printers
 // -----------------------------------------------------------------------
 
-function makeMovieProgressPrinter(): {
+type MoviePrinter = {
   onMainProgress: (frac: number, task?: string) => void;
   onExtraProgress: (idx: number, total: number, frac: number, task?: string) => void;
   onTitleDone: (kind: "main" | "extra", idx: number, total: number, skipped: boolean) => void;
-} {
+};
+
+function makeMovieProgressPrinter(json: boolean): MoviePrinter {
+  if (json) {
+    return {
+      onMainProgress: (frac, task) =>
+        emitJson("progress", { title_kind: "main", frac, task: task ?? null }),
+      onExtraProgress: (idx, total, frac, task) =>
+        emitJson("progress", {
+          title_kind: "extra",
+          idx,
+          total,
+          frac,
+          task: task ?? null,
+        }),
+      onTitleDone: (kind, idx, total, skipped) =>
+        emitJson("title_done", { title_kind: kind, idx, total, skipped }),
+    };
+  }
   let lastKey = "";
   const writeLine = (label: string, frac: number, task?: string) => {
     const pct = Math.floor(frac * 100);
@@ -704,11 +846,35 @@ function makeMovieProgressPrinter(): {
   };
 }
 
-function makeTvProgressPrinter(): {
+type TvPrinter = {
   onEpisodeProgress: (epIdx: number, epTotal: number, frac: number, task?: string) => void;
   onExtraProgress: (idx: number, total: number, frac: number, task?: string) => void;
   onTitleDone: (kind: "episode" | "extra", idx: number, total: number, skipped: boolean) => void;
-} {
+};
+
+function makeTvProgressPrinter(json: boolean): TvPrinter {
+  if (json) {
+    return {
+      onEpisodeProgress: (idx, total, frac, task) =>
+        emitJson("progress", {
+          title_kind: "episode",
+          idx,
+          total,
+          frac,
+          task: task ?? null,
+        }),
+      onExtraProgress: (idx, total, frac, task) =>
+        emitJson("progress", {
+          title_kind: "extra",
+          idx,
+          total,
+          frac,
+          task: task ?? null,
+        }),
+      onTitleDone: (kind, idx, total, skipped) =>
+        emitJson("title_done", { title_kind: kind, idx, total, skipped }),
+    };
+  }
   let lastKey = "";
   const writeLine = (label: string, frac: number, task?: string) => {
     const pct = Math.floor(frac * 100);
@@ -737,6 +903,92 @@ function renderBar(frac: number): string {
   const width = 20;
   const filled = Math.min(width, Math.max(0, Math.floor(frac * width)));
   return `[${"#".repeat(filled)}${".".repeat(width - filled)}]`;
+}
+
+// JSON event builders ----------------------------------------------------
+
+function buildMoviePlanEvent(
+  disc: DiscRow,
+  movie: MovieRow,
+  selection: MovieSelection,
+  source: string,
+): Record<string, unknown> {
+  return {
+    media_kind: "movie",
+    source,
+    disc: {
+      fingerprint: disc.fingerprint,
+      volume_label: disc.volume_label,
+    },
+    movie: {
+      tmdb_id: movie.tmdb_id,
+      imdb_id: movie.imdb_id,
+      title: movie.title,
+      year: movie.year,
+      runtime_min: movie.runtime_min,
+    },
+    main: {
+      makemkv_id: selection.main.makemkv_id,
+      duration_s: selection.main.duration_s,
+      segment_map: selection.main.segment_map,
+    },
+    extras: selection.extras.map((t) => ({
+      makemkv_id: t.makemkv_id,
+      duration_s: t.duration_s,
+    })),
+    skipped: selection.skipped.map(({ title, reason }) => ({
+      makemkv_id: title.makemkv_id,
+      duration_s: title.duration_s,
+      reason,
+    })),
+  };
+}
+
+function buildTvPlanEvent(
+  disc: DiscRow,
+  show: { id: number; name: string; imdb_id: string | null },
+  seasonNumber: number,
+  episodeOrder: EpisodeOrder,
+  selection: TvSelection,
+  source: string,
+  seasonSource: "flag" | "parsed",
+): Record<string, unknown> {
+  return {
+    media_kind: "tv",
+    source,
+    season_source: seasonSource,
+    disc: {
+      fingerprint: disc.fingerprint,
+      volume_label: disc.volume_label,
+    },
+    show: {
+      tmdb_id: show.id,
+      imdb_id: show.imdb_id,
+      name: show.name,
+    },
+    season: { season_number: seasonNumber, episode_order: episodeOrder },
+    cohort: {
+      count: selection.cohort.count,
+      median_s: selection.cohort.median,
+      rel_stdev: selection.cohort.relStdev,
+      outlier_makemkv_id: selection.cohort.outlierIncluded?.makemkv_id ?? null,
+    },
+    episode_map: selection.episodeMap.map(({ title, episode }) => ({
+      makemkv_id: title.makemkv_id,
+      duration_s: title.duration_s,
+      episode_number: episode.episode_number,
+      episode_name: episode.name,
+    })),
+    extras: selection.extras.map((t) => ({
+      makemkv_id: t.makemkv_id,
+      duration_s: t.duration_s,
+    })),
+    skipped: selection.skipped.map(({ title, reason }) => ({
+      makemkv_id: title.makemkv_id,
+      duration_s: title.duration_s,
+      reason,
+    })),
+  };
 }
 
 // -----------------------------------------------------------------------

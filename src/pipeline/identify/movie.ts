@@ -6,9 +6,11 @@ import type {
   MovieSearchResult,
   TmdbClient,
 } from "../../metadata/tmdb.ts";
+import type { OmdbClient, OmdbMovie } from "../../metadata/omdb.ts";
 
 export type MovieIdentifyOpts = {
   client: TmdbClient;
+  omdbClient?: OmdbClient | null | undefined;
   tmdbId?: number | undefined;
   imdbId?: string | undefined;
   titleHint?: string | undefined;
@@ -16,9 +18,17 @@ export type MovieIdentifyOpts = {
   parentDirName?: string | null | undefined;
 };
 
+export type MovieIdentifySource =
+  | "direct-tmdb"
+  | "direct-imdb"
+  | "direct-imdb-omdb"
+  | "search"
+  | "omdb"
+  | "omdb-bridge-tmdb";
+
 export type MovieIdentifyResult = {
   details: MovieDetails;
-  source: "direct-tmdb" | "direct-imdb" | "search";
+  source: MovieIdentifySource;
   query?: string;
 };
 
@@ -36,8 +46,15 @@ export async function identifyMovie(opts: MovieIdentifyOpts): Promise<MovieIdent
   }
   if (opts.imdbId !== undefined) {
     const details = await opts.client.findByImdb(opts.imdbId);
-    if (!details) throw new Error(`No TMDB entry found for IMDb id ${opts.imdbId}`);
-    return { details, source: "direct-imdb" };
+    if (details) return { details, source: "direct-imdb" };
+    // TMDB doesn't know this IMDb id; OMDb sometimes does.
+    if (opts.omdbClient) {
+      const omdb = await opts.omdbClient.findByImdb(opts.imdbId);
+      if (omdb) {
+        return { details: omdbToMovieDetails(omdb), source: "direct-imdb-omdb" };
+      }
+    }
+    throw new Error(`No entry found for IMDb id ${opts.imdbId}`);
   }
 
   const queries = [opts.titleHint, opts.volumeLabel, opts.parentDirName]
@@ -51,6 +68,8 @@ export async function identifyMovie(opts: MovieIdentifyOpts): Promise<MovieIdent
   }
 
   let lastErr: unknown;
+
+  // 1. TMDB search across each candidate query.
   for (const q of queries) {
     const { name, year } = parseTitleAndYear(q);
     let results: MovieSearchResult[];
@@ -67,8 +86,47 @@ export async function identifyMovie(opts: MovieIdentifyOpts): Promise<MovieIdent
     return { details, source: "search", query: q };
   }
 
+  // 2. OMDb fallback when TMDB came up empty (§9). Try to bridge back to
+  //    TMDB via the IMDb id OMDb returns — TMDB's data is richer.
+  if (opts.omdbClient) {
+    for (const q of queries) {
+      const { name, year } = parseTitleAndYear(q);
+      let omdb: OmdbMovie | null;
+      try {
+        omdb = await opts.omdbClient.searchByTitle(name, year);
+      } catch (e) {
+        lastErr = e;
+        continue;
+      }
+      if (!omdb) continue;
+      try {
+        const bridged = await opts.client.findByImdb(omdb.imdb_id);
+        if (bridged) return { details: bridged, source: "omdb-bridge-tmdb", query: q };
+      } catch {
+        // Fall through to using OMDb directly.
+      }
+      return { details: omdbToMovieDetails(omdb), source: "omdb", query: q };
+    }
+  }
+
   if (lastErr) throw lastErr;
-  throw new Error(`No TMDB results for any candidate query: ${queries.join(", ")}`);
+  const fallbackHint = opts.omdbClient ? " or OMDb" : "";
+  throw new Error(
+    `No TMDB${fallbackHint} results for any candidate query: ${queries.join(", ")}`,
+  );
+}
+
+function omdbToMovieDetails(o: OmdbMovie): MovieDetails {
+  return {
+    id: null,
+    title: o.title,
+    original_title: o.title,
+    release_date: o.year ? `${o.year}-01-01` : null,
+    runtime: o.runtime_min,
+    imdb_id: o.imdb_id,
+    popularity: 0,
+    raw: o.raw,
+  };
 }
 
 function checkAmbiguity(results: MovieSearchResult[]): void {
@@ -99,21 +157,33 @@ export function persistMovie(
   const year = details.release_date ? Number(details.release_date.slice(0, 4)) : null;
   const raw = JSON.stringify(details.raw);
 
-  // Upsert by tmdb_id (canonical) and back-fill imdb_id when present.
-  const existing = db
-    .query<MovieRow, [number]>(`SELECT * FROM movie WHERE tmdb_id = ?`)
-    .get(details.id);
+  // Look up an existing row by tmdb_id first (canonical), then by imdb_id
+  // (so an OMDb-only identification can later be merged with a richer
+  // TMDB result).
+  let existing: MovieRow | null = null;
+  if (details.id != null) {
+    existing = db
+      .query<MovieRow, [number]>(`SELECT * FROM movie WHERE tmdb_id = ?`)
+      .get(details.id);
+  }
+  if (!existing && details.imdb_id) {
+    existing = db
+      .query<MovieRow, [string]>(`SELECT * FROM movie WHERE imdb_id = ?`)
+      .get(details.imdb_id);
+  }
 
   let movie: MovieRow;
   if (existing) {
     db.run(
-      `UPDATE movie SET imdb_id = ?, title = ?, year = ?, runtime_min = ?, raw_response = ?
+      `UPDATE movie SET tmdb_id = COALESCE(?, tmdb_id), imdb_id = COALESCE(?, imdb_id),
+                       title = ?, year = ?, runtime_min = ?, raw_response = ?
        WHERE id = ?`,
-      [details.imdb_id, details.title, year, details.runtime, raw, existing.id],
+      [details.id, details.imdb_id, details.title, year, details.runtime, raw, existing.id],
     );
     movie = {
       ...existing,
-      imdb_id: details.imdb_id,
+      tmdb_id: details.id ?? existing.tmdb_id,
+      imdb_id: details.imdb_id ?? existing.imdb_id,
       title: details.title,
       year,
       runtime_min: details.runtime,
@@ -121,7 +191,10 @@ export function persistMovie(
     };
   } else {
     const row = db
-      .query<MovieRow, [number, string | null, string, number | null, number | null, string]>(
+      .query<
+        MovieRow,
+        [number | null, string | null, string, number | null, number | null, string]
+      >(
         `INSERT INTO movie (tmdb_id, imdb_id, title, year, runtime_min, raw_response)
          VALUES (?, ?, ?, ?, ?, ?)
          RETURNING *`,

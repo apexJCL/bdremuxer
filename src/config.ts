@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 
 export type Config = {
   tmdbApiKey: string | null;
+  omdbApiKey: string | null;
   outDir: string;
   dbPath: string;
 };
@@ -24,5 +25,6 @@ export function loadConfig(overrides: ConfigOverrides = {}): Config {
       join(outDir, ".bdremuxer.sqlite"),
   );
   const tmdbApiKey = process.env["BDREMUXER_TMDB_API_KEY"] ?? null;
-  return { tmdbApiKey, outDir, dbPath };
+  const omdbApiKey = process.env["BDREMUXER_OMDB_API_KEY"] ?? null;
+  return { tmdbApiKey, omdbApiKey, outDir, dbPath };
 }
