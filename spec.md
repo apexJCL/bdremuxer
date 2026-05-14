@@ -265,6 +265,12 @@ bdremuxer batch <parent-dir> [global flags] [identification flags] [selection fl
   --min-length-skip <N>(s|m|h) | false    (default: 90s)
 ```
 
+`bdremuxer init-batch <parent-dir> [--empty] [--force]` scaffolds a
+`bdremuxer.batch.toml` either interactively (default; groups discs by
+season-hint and prompts per group) or as a commented template
+(`--empty`). Useful for bootstrapping a multi-disc batch without
+hand-writing the TOML.
+
 Subcommands (later, not v1): `bdremuxer ls`, `bdremuxer reidentify <disc>`,
 `bdremuxer export-nfo`.
 

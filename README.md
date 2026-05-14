@@ -69,6 +69,23 @@ Process every BDMV folder under a parent directory:
 bdremuxer batch ~/library/blu-rays --include-extras --continue-on-error
 ```
 
+Need to scaffold the override TOML first?
+
+```sh
+# interactive wizard: walks the discs, asks per group/disc
+bdremuxer init-batch ~/library/blu-rays
+
+# or a commented-out template you can fill in by hand
+bdremuxer init-batch ~/library/blu-rays --empty
+
+# add --force to overwrite an existing bdremuxer.batch.toml
+```
+
+The wizard groups discs that share a `(show, season)` pattern (e.g.
+`Breaking Bad - S2 - Disc 1/2/3`) and asks once per group. Per-disc
+`starting_episode` values are emitted as `TODO`-flagged stubs that you
+fill in manually — the wizard doesn't try to guess them.
+
 A few rules:
 
 - The walker descends until it finds `BDMV/index.bdmv` and then stops

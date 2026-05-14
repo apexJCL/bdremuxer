@@ -12,6 +12,8 @@ import {
   resolveDiscOverrides,
   walkBdmvFolders,
 } from "./batch.ts";
+import { runInitBatch } from "./init-batch.ts";
+import { Prompter } from "./parse/prompt.ts";
 import type { CliOpts } from "./opts.ts";
 
 import { discoverMakemkvcon } from "./makemkv/discover.ts";
@@ -218,6 +220,48 @@ batchCmd.action(async function batchAction(this: Command, parentDir: string) {
   const code = await runBatch(parentDir, opts);
   process.exit(code);
 });
+
+// --- init-batch subcommand ----------------------------------------------
+
+program
+  .command("init-batch <parent-dir>")
+  .description(
+    "scaffold a bdremuxer.batch.toml — interactive wizard by default,\n" +
+      "or --empty for a commented template",
+  )
+  .option("--empty", "skip the wizard; write a commented template")
+  .option("--force", "overwrite an existing bdremuxer.batch.toml")
+  .action(
+    async function initBatchAction(
+      this: Command,
+      parentDir: string,
+      sub: { empty?: boolean; force?: boolean },
+    ) {
+      let prompter: Prompter | undefined;
+      try {
+        prompter = sub.empty ? undefined : new Prompter();
+        const res = await runInitBatch({
+          parentDir,
+          empty: !!sub.empty,
+          force: !!sub.force,
+          prompter,
+        });
+        process.stdout.write(`\nWrote ${res.path} (${res.bytes} bytes)\n`);
+        if (!sub.empty && res.discCount > 0) {
+          process.stdout.write(
+            `Reviewed ${res.discCount} disc(s).` +
+              ` Edit the file to fine-tune per-disc starting_episode values.\n`,
+          );
+        }
+        process.exit(0);
+      } catch (e) {
+        process.stderr.write(`${(e as Error).message}\n`);
+        process.exit(1);
+      } finally {
+        prompter?.close();
+      }
+    },
+  );
 
 await program.parseAsync(process.argv);
 
