@@ -567,8 +567,12 @@ bdremuxer/
   .github/workflows/release.yml   # cross-compile + attach artefacts
 ```
 
-CLI argv parser: stick to a small dependency-light option (e.g. `citty` or
-hand-rolled) — heavy frameworks bloat the compiled binary.
+CLI argv parser: M1–M6 use Bun's built-in `node:util.parseArgs` (zero
+deps, fine for a single-command surface). M7 migrates to **commander.js**
+ahead of batch-mode subcommands — `parseArgs` has no subcommand model,
+and commander's declarative option + subcommand definitions plus
+auto-generated help replace the hand-maintained `HELP` template. Bundle
+cost is small (~50 KB into the standalone binary).
 
 ## 12. Milestones
 
@@ -584,13 +588,22 @@ hand-rolled) — heavy frameworks bloat the compiled binary.
 5. **M5 — TV remux + multi-disc seasons.** End-to-end for a TV disc,
    including `--starting-episode` and merging multiple discs into a shared
    `Season NN/` directory.
-6. **M6 — Extras + resume.** `--include-extras` for both kinds, the
-   `<90s` pre-filter, resume-from-stage, `--force`, structured logs.
-7. **M7 — Batch + flat output.** `bdremuxer batch <parent-dir>`, per-disc
-   `bdremuxer.toml` sidecars AND top-level `bdremuxer.batch.toml` glob
-   blocks, `--output-format=flat`, `--continue-on-error`.
-8. **M8 — Polish.** OMDb fallback, JSON progress mode, GH Actions release
-   workflow producing the macOS arm64 binary, README.
+6. **M6 — Extras + resume.** `--include-extras` for both kinds,
+   resume-from-stage (skip the probe stage when titles are already
+   cached in the DB), and finalize behaviour for failed/interrupted
+   runs.
+7. **M7 — CLI refactor to commander.js.** Replace the hand-rolled
+   `node:util.parseArgs` flow with [commander](https://github.com/tj/commander.js)
+   ahead of M8's batch subcommand. Wins: declarative subcommand
+   definitions, auto-generated help (retires the hand-maintained
+   `HELP` template), per-subcommand option scopes, deferred actions.
+   Cost: ~50 KB into the compiled binary; one new runtime dep.
+8. **M8 — Batch + flat output.** `bdremuxer batch <parent-dir>`,
+   per-disc `bdremuxer.toml` sidecars AND top-level
+   `bdremuxer.batch.toml` glob blocks, `--output-format=flat`,
+   `--continue-on-error`.
+9. **M9 — Polish.** OMDb fallback, JSON progress mode, GH Actions
+   release workflow producing the macOS arm64 binary, README.
 
 ## 13. Open questions
 

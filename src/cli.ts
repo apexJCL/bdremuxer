@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 //
-// M4: same as M3 for movies; TV discs go scan → probe → classify →
-// identify (TV) → select (TV) → print episode plan. No TV remux yet.
+// M6: full pipeline for both movies and TV, including extras and a
+// resume-from-probe optimization (skip `makemkvcon info` when titles are
+// already cached in the DB).
 
 import { parseArgs } from "node:util";
 import { statSync } from "node:fs";
@@ -9,12 +10,17 @@ import { basename, join, resolve, dirname } from "node:path";
 
 import { discoverMakemkvcon } from "./makemkv/discover.ts";
 import { runInfo } from "./makemkv/cli.ts";
-import type { TitleInfo, ProbeResult as RobotProbe } from "./makemkv/robot.ts";
-import { CINFO } from "./makemkv/codes.ts";
 
 import { loadConfig } from "./config.ts";
 import { openDb } from "./db.ts";
-import type { DiscRow, EpisodeOrder, MovieRow, TitleRow } from "./db.ts";
+import type {
+  DB,
+  DiscRow,
+  EpisodeOrder,
+  MovieRow,
+  TitleRow,
+  TrackRow,
+} from "./db.ts";
 
 import { scan } from "./pipeline/scan.ts";
 import { persistProbe } from "./pipeline/probe.ts";
@@ -46,7 +52,7 @@ import { formatHms, parseDurationFlag } from "./parse/duration.ts";
 
 import { version as PKG_VERSION } from "../package.json";
 
-const HELP = `bdremuxer (M4)
+const HELP = `bdremuxer (M6)
 
 Usage:
   bdremuxer <BDMV path> [options]
@@ -68,7 +74,8 @@ Classification:
   --type movie|tv|auto     default: auto
 
 Selection:
-  --include-extras
+  --include-extras         remux every non-main / non-episode title that
+                           survives the pre-filter into <out>/.../extras/
   --min-length-skip <N>(s|m|h) | false   default: 90s
 
 Paths / behaviour:
@@ -76,12 +83,13 @@ Paths / behaviour:
   --db PATH                override the SQLite DB path
   --makemkvcon PATH        override the makemkvcon binary
   --dry-run                stop after select, print plan (no remux)
-  --force                  re-run remux even if disc.status='done'
-  -v, --verbose
-  -h, --help
+  --force                  re-probe and re-remux even if cached / done
 
-Note: M4 only remuxes movie discs. TV discs stop after the identify/select
-plan; TV remux lands in M5.
+Resume behaviour:
+  On re-runs, the probe stage is skipped when title rows are already
+  cached in the DB for this disc. Pass --force to drop the cache and
+  re-probe. Per-title remux is always skipped when the target MKV file
+  already exists unless --force.
 
 Environment:
   BDREMUXER_TMDB_API_KEY   required for identification
@@ -200,15 +208,27 @@ async function main(argv: string[]): Promise<number> {
       return 0;
     }
 
-    // §5.2 Probe
-    log("probe...");
-    const { probe } = await runInfo({
-      makemkvcon,
-      source: `file:${discRoot}`,
-      echoStderr: values.verbose,
-    });
-    const titleRows = persistProbe(db, scanRes.disc.id, probe);
-    log(`probe: ${titleRows.length} titles persisted`);
+    // §5.2 Probe — skipped when cached (resume-from-probe). --force drops
+    // the cache and re-probes; persistProbe always DELETE+INSERTs.
+    let titleRows: TitleRow[];
+    const cachedTitles = db
+      .query<TitleRow, [number]>(
+        `SELECT * FROM title WHERE disc_id = ? ORDER BY makemkv_id`,
+      )
+      .all(scanRes.disc.id);
+    if (cachedTitles.length > 0 && !values.force) {
+      titleRows = cachedTitles;
+      log(`probe: reusing ${titleRows.length} cached titles (--force to re-probe)`);
+    } else {
+      log("probe...");
+      const { probe } = await runInfo({
+        makemkvcon,
+        source: `file:${discRoot}`,
+        echoStderr: values.verbose,
+      });
+      titleRows = persistProbe(db, scanRes.disc.id, probe);
+      log(`probe: ${titleRows.length} titles persisted`);
+    }
 
     // §5.3 Classify
     const parentDirName = basename(dirname(discRoot));
@@ -290,6 +310,7 @@ async function main(argv: string[]): Promise<number> {
       // --dry-run: stop after select, print plan only.
       if (values["dry-run"]) {
         printTvPlan({
+          db,
           disc: persisted.disc,
           show: tvIdentified.show,
           seasonNumber: tvIdentified.season.season_number,
@@ -297,7 +318,6 @@ async function main(argv: string[]): Promise<number> {
           selection: tvSelection,
           source: tvIdentified.source,
           seasonSource: tvIdentified.seasonSource,
-          probe,
           dryRun: true,
         });
         return 0;
@@ -306,7 +326,7 @@ async function main(argv: string[]): Promise<number> {
       // §5.6 Remux (TV) + §5.7 Finalize
       const tvRunId = startRun(db, persisted.disc.id);
       try {
-        const printer = makeTvProgressPrinter();
+        const tvPrinter = makeTvProgressPrinter();
         const remuxResult = await remuxTvEpisodes({
           db,
           outDir: cfg.outDir,
@@ -316,11 +336,13 @@ async function main(argv: string[]): Promise<number> {
           show: persisted.show,
           season: persisted.season,
           episodeMap: tvSelection.episodeMap,
+          extras: tvSelection.extras,
           runId: tvRunId,
           force: !!values.force,
           shortFp,
-          onProgress: printer.onProgress,
-          onEpisodeDone: printer.onEpisodeDone,
+          onEpisodeProgress: tvPrinter.onEpisodeProgress,
+          onExtraProgress: tvPrinter.onExtraProgress,
+          onTitleDone: tvPrinter.onTitleDone,
         });
 
         const titlesAfter = db
@@ -348,7 +370,8 @@ async function main(argv: string[]): Promise<number> {
         printTvDone({
           show: persisted.show,
           seasonNumber: persisted.season.season_number,
-          outputs: remuxResult.outputs,
+          episodes: remuxResult.episodes,
+          extras: remuxResult.extras,
           manifestPath,
           logPath: remuxResult.logPath,
         });
@@ -406,9 +429,9 @@ async function main(argv: string[]): Promise<number> {
     // --dry-run: stop after select, print the plan as M2 did.
     if (values["dry-run"]) {
       printPlan({
+        db,
         disc: discIdentified,
         movie,
-        probe,
         selection,
         source: identified.source,
         dryRun: true,
@@ -420,6 +443,7 @@ async function main(argv: string[]): Promise<number> {
     const runId = startRun(db, discIdentified.id);
 
     try {
+      const moviePrinter = makeMovieProgressPrinter();
       const remuxResult = await remuxMovieMain({
         db,
         outDir: cfg.outDir,
@@ -428,13 +452,14 @@ async function main(argv: string[]): Promise<number> {
         disc: discIdentified,
         movie,
         mainTitle: selection.main,
+        extras: selection.extras,
         runId,
         force: !!values.force,
         shortFp,
-        onProgress: makeProgressPrinter(),
+        onMainProgress: moviePrinter.onMainProgress,
+        onExtraProgress: moviePrinter.onExtraProgress,
+        onTitleDone: moviePrinter.onTitleDone,
       });
-      // newline after the \r-overwritten progress line
-      process.stderr.write("\n");
 
       // Re-read titles so manifest reflects the persisted roles & output_path
       const titlesAfter = db
@@ -453,11 +478,10 @@ async function main(argv: string[]): Promise<number> {
       });
 
       printDone({
-        disc: discIdentified,
         movie,
-        outputPath: remuxResult.outputPath,
+        main: remuxResult.main,
+        extras: remuxResult.extras,
         manifestPath,
-        skipped: remuxResult.skipped,
         logPath: remuxResult.logPath,
       });
       return 0;
@@ -476,43 +500,58 @@ async function main(argv: string[]): Promise<number> {
 
 // ---- progress ----------------------------------------------------------
 
-function makeProgressPrinter(): (frac: number, task?: string) => void {
-  let lastPct = -1;
-  let lastTask = "";
-  return (frac, task) => {
+function makeMovieProgressPrinter(): {
+  onMainProgress: (frac: number, task?: string) => void;
+  onExtraProgress: (idx: number, total: number, frac: number, task?: string) => void;
+  onTitleDone: (kind: "main" | "extra", idx: number, total: number, skipped: boolean) => void;
+} {
+  let lastKey = "";
+  const writeLine = (label: string, frac: number, task?: string) => {
     const pct = Math.floor(frac * 100);
-    if (pct === lastPct && task === lastTask) return;
-    lastPct = pct;
-    lastTask = task ?? lastTask;
+    const key = `${label}-${pct}-${task ?? ""}`;
+    if (key === lastKey) return;
+    lastKey = key;
     const bar = renderBar(frac);
-    const label = task ? ` ${task}` : "";
-    process.stderr.write(`\rRemux: ${bar} ${pct.toString().padStart(3)}%${label}   `);
+    const taskLabel = task ? ` ${task}` : "";
+    process.stderr.write(`\r${label}: ${bar} ${pct.toString().padStart(3)}%${taskLabel}   `);
+  };
+  return {
+    onMainProgress: (frac, task) => writeLine("Main", frac, task),
+    onExtraProgress: (idx, total, frac, task) =>
+      writeLine(`Extra ${idx}/${total}`, frac, task),
+    onTitleDone: (kind, idx, total, skipped) => {
+      const label = kind === "main" ? "Main" : `Extra ${idx}/${total}`;
+      if (skipped) process.stderr.write(`\r${label}: already on disk, skipped       \n`);
+      else process.stderr.write("\n");
+      lastKey = "";
+    },
   };
 }
 
 function makeTvProgressPrinter(): {
-  onProgress: (epIdx: number, epTotal: number, frac: number, task?: string) => void;
-  onEpisodeDone: (epIdx: number, epTotal: number, skipped: boolean) => void;
+  onEpisodeProgress: (epIdx: number, epTotal: number, frac: number, task?: string) => void;
+  onExtraProgress: (idx: number, total: number, frac: number, task?: string) => void;
+  onTitleDone: (kind: "episode" | "extra", idx: number, total: number, skipped: boolean) => void;
 } {
   let lastKey = "";
+  const writeLine = (label: string, frac: number, task?: string) => {
+    const pct = Math.floor(frac * 100);
+    const key = `${label}-${pct}-${task ?? ""}`;
+    if (key === lastKey) return;
+    lastKey = key;
+    const bar = renderBar(frac);
+    const taskLabel = task ? ` ${task}` : "";
+    process.stderr.write(`\r${label}: ${bar} ${pct.toString().padStart(3)}%${taskLabel}   `);
+  };
   return {
-    onProgress: (epIdx, epTotal, frac, task) => {
-      const pct = Math.floor(frac * 100);
-      const key = `${epIdx}-${pct}-${task ?? ""}`;
-      if (key === lastKey) return;
-      lastKey = key;
-      const bar = renderBar(frac);
-      const label = task ? ` ${task}` : "";
-      process.stderr.write(
-        `\rEp ${epIdx}/${epTotal}: ${bar} ${pct.toString().padStart(3)}%${label}   `,
-      );
-    },
-    onEpisodeDone: (epIdx, epTotal, skipped) => {
-      if (skipped) {
-        process.stderr.write(`Ep ${epIdx}/${epTotal}: already on disk, skipped\n`);
-      } else {
-        process.stderr.write("\n");
-      }
+    onEpisodeProgress: (epIdx, epTotal, frac, task) =>
+      writeLine(`Ep ${epIdx}/${epTotal}`, frac, task),
+    onExtraProgress: (idx, total, frac, task) =>
+      writeLine(`Extra ${idx}/${total}`, frac, task),
+    onTitleDone: (kind, idx, total, skipped) => {
+      const label = kind === "episode" ? `Ep ${idx}/${total}` : `Extra ${idx}/${total}`;
+      if (skipped) process.stderr.write(`\r${label}: already on disk, skipped       \n`);
+      else process.stderr.write("\n");
       lastKey = "";
     },
   };
@@ -525,45 +564,65 @@ function renderBar(frac: number): string {
 }
 
 // ---- printing -----------------------------------------------------------
+//
+// All print* functions read stream details from the `track` table rather
+// than the live makemkvcon probe output, so they work the same on a fresh
+// run and on a resume (where the probe was skipped).
 
-type PlanInput = {
+function loadTracks(db: DB, titleId: number): TrackRow[] {
+  return db
+    .query<TrackRow, [number]>(
+      `SELECT * FROM track WHERE title_id = ? ORDER BY id`,
+    )
+    .all(titleId);
+}
+
+function printTitleLine(
+  db: DB,
+  t: TitleRow,
+  indent: string = "  ",
+): void {
+  const w = (s: string) => process.stdout.write(s);
+  w(
+    `${indent}#${t.makemkv_id.toString().padStart(2, "0")}  ${formatHms(t.duration_s)}  ` +
+      `${(t.size_bytes / 1e9).toFixed(2)} GB  segs=${t.segment_map ?? "-"}\n`,
+  );
+  for (const tr of loadTracks(db, t.id)) {
+    w(
+      `${indent}    ${tr.kind.padEnd(9)} ${(tr.language ?? "---").padEnd(4)} ${tr.codec ?? "?"}\n`,
+    );
+  }
+}
+
+function printPlan(p: {
+  db: DB;
   disc: DiscRow;
   movie: Pick<MovieRow, "tmdb_id" | "imdb_id" | "title" | "year" | "runtime_min">;
-  probe: RobotProbe;
   selection: MovieSelection;
   source: string;
   dryRun: boolean;
-};
-
-function printPlan(p: PlanInput): void {
+}): void {
   const w = (s: string) => process.stdout.write(s);
-  const discName =
-    p.probe.disc.get(CINFO.NAME) ??
-    p.probe.disc.get(CINFO.VOLUME_NAME) ??
-    p.disc.volume_label ??
-    "(unknown)";
 
-  w(`${p.dryRun ? "[dry-run] " : ""}Disc: ${discName}\n`);
+  w(`${p.dryRun ? "[dry-run] " : ""}Disc: ${p.disc.volume_label ?? "(unknown)"}\n`);
   w(`  fingerprint: ${p.disc.fingerprint.slice(0, 12)}…\n`);
   w(`  status:      ${p.disc.status}\n`);
-  w(`  kind:        ${p.disc.media_kind}\n`);
-  w("\n");
+  w(`  kind:        ${p.disc.media_kind}\n\n`);
 
   w(`Proposed match  (via ${p.source}):\n`);
   w(`  ${p.movie.title}${p.movie.year ? ` (${p.movie.year})` : ""}\n`);
   w(`  TMDB:  ${p.movie.tmdb_id ?? "-"}\n`);
   w(`  IMDb:  ${p.movie.imdb_id ?? "-"}\n`);
   w(
-    `  Runtime: ${p.movie.runtime_min != null ? `${p.movie.runtime_min} min` : "(unknown)"}\n`,
+    `  Runtime: ${p.movie.runtime_min != null ? `${p.movie.runtime_min} min` : "(unknown)"}\n\n`,
   );
-  w("\n");
 
   w("Main title:\n");
-  printTitleLine(p.probe, p.selection.main);
+  printTitleLine(p.db, p.selection.main);
 
   if (p.selection.extras.length > 0) {
     w(`Extras (${p.selection.extras.length}):\n`);
-    for (const t of p.selection.extras) printTitleLine(p.probe, t);
+    for (const t of p.selection.extras) printTitleLine(p.db, t);
   }
 
   if (p.selection.skipped.length > 0) {
@@ -579,6 +638,7 @@ function printPlan(p: PlanInput): void {
 }
 
 function printTvPlan(p: {
+  db: DB;
   disc: DiscRow;
   show: { id: number; name: string; imdb_id: string | null };
   seasonNumber: number;
@@ -586,21 +646,14 @@ function printTvPlan(p: {
   selection: TvSelection;
   source: string;
   seasonSource: "flag" | "parsed";
-  probe: RobotProbe;
   dryRun?: boolean;
 }): void {
   const w = (s: string) => process.stdout.write(s);
-  const discName =
-    p.probe.disc.get(CINFO.NAME) ??
-    p.probe.disc.get(CINFO.VOLUME_NAME) ??
-    p.disc.volume_label ??
-    "(unknown)";
 
-  w(`Disc: ${discName}\n`);
+  w(`Disc: ${p.disc.volume_label ?? "(unknown)"}\n`);
   w(`  fingerprint: ${p.disc.fingerprint.slice(0, 12)}…\n`);
   w(`  kind:        tv\n`);
-  w(`  status:      ${p.disc.status}\n`);
-  w("\n");
+  w(`  status:      ${p.disc.status}\n\n`);
 
   w(`Proposed show  (via ${p.source}):\n`);
   w(`  ${p.show.name}\n`);
@@ -615,14 +668,13 @@ function printTvPlan(p: {
       (p.selection.cohort.outlierIncluded
         ? ` (incl. outlier #${p.selection.cohort.outlierIncluded.makemkv_id})`
         : "") +
-      "\n",
+      "\n\n",
   );
-  w("\n");
 
   w("Episode mapping:\n");
+  const seasonStr = p.seasonNumber.toString().padStart(2, "0");
   for (const { title, episode } of p.selection.episodeMap) {
     const epNumStr = episode.episode_number.toString().padStart(2, "0");
-    const seasonStr = p.seasonNumber.toString().padStart(2, "0");
     const titleStr = title.makemkv_id.toString().padStart(2, "0");
     const epName = episode.name ?? `Episode ${epNumStr}`;
     w(
@@ -651,64 +703,63 @@ function printTvPlan(p: {
   if (p.dryRun) w("\nDry run — no remux performed.\n");
 }
 
+function printDone(p: {
+  movie: Pick<MovieRow, "title" | "year">;
+  main: { outputPath: string; skipped: boolean };
+  extras: Array<{ title: TitleRow; outputPath: string; skipped: boolean }>;
+  manifestPath: string;
+  logPath: string;
+}): void {
+  const w = (s: string) => process.stdout.write(s);
+  const titleStr = `${p.movie.title}${p.movie.year ? ` (${p.movie.year})` : ""}`;
+  const verb = p.main.skipped ? "Already remuxed" : "Remuxed";
+  w(`\n${verb}: ${titleStr}\n`);
+  w(`  Main:     ${p.main.outputPath}${p.main.skipped ? " [skipped]" : ""}\n`);
+  if (p.extras.length > 0) {
+    const skipped = p.extras.filter((e) => e.skipped).length;
+    w(`  Extras:   ${p.extras.length - skipped} remuxed${skipped ? `, ${skipped} skipped` : ""}\n`);
+    for (const e of p.extras) {
+      w(`    ${e.outputPath}${e.skipped ? " [skipped]" : ""}\n`);
+    }
+  }
+  w(`  Manifest: ${p.manifestPath}\n`);
+  w(`  Log:      ${p.logPath}\n`);
+}
+
 function printTvDone(p: {
   show: { name: string; first_air_year: number | null };
   seasonNumber: number;
-  outputs: Array<{
+  episodes: Array<{
     title: TitleRow;
     episode: { episode_number: number; name: string | null };
     outputPath: string;
     skipped: boolean;
   }>;
+  extras: Array<{ title: TitleRow; outputPath: string; skipped: boolean }>;
   manifestPath: string;
   logPath: string;
 }): void {
   const w = (s: string) => process.stdout.write(s);
   const seasonStr = p.seasonNumber.toString().padStart(2, "0");
   const yearPart = p.show.first_air_year ? ` (${p.show.first_air_year})` : "";
-  const skippedCount = p.outputs.filter((o) => o.skipped).length;
-  const remuxedCount = p.outputs.length - skippedCount;
+  const skippedEps = p.episodes.filter((o) => o.skipped).length;
+  const remuxedEps = p.episodes.length - skippedEps;
 
   w(`\n${p.show.name}${yearPart} — Season ${seasonStr}\n`);
-  w(`  Episodes remuxed: ${remuxedCount}${skippedCount ? `, skipped: ${skippedCount}` : ""}\n`);
-  for (const o of p.outputs) {
+  w(`  Episodes: ${remuxedEps} remuxed${skippedEps ? `, ${skippedEps} skipped` : ""}\n`);
+  for (const o of p.episodes) {
     const tag = o.skipped ? " [skipped]" : "";
-    w(`  S${seasonStr}E${o.episode.episode_number.toString().padStart(2, "0")}  ${o.outputPath}${tag}\n`);
+    w(
+      `    S${seasonStr}E${o.episode.episode_number.toString().padStart(2, "0")}  ${o.outputPath}${tag}\n`,
+    );
   }
-  w(`  Manifest: ${p.manifestPath}\n`);
-  w(`  Log:      ${p.logPath}\n`);
-}
-
-function printTitleLine(probe: RobotProbe, t: TitleRow): void {
-  const w = (s: string) => process.stdout.write(s);
-  const info: TitleInfo | undefined = probe.titles.get(t.makemkv_id);
-  w(
-    `  #${t.makemkv_id.toString().padStart(2, "0")}  ${formatHms(t.duration_s)}  ` +
-      `${(t.size_bytes / 1e9).toFixed(2)} GB  segs=${t.segment_map ?? "-"}\n`,
-  );
-  if (info) {
-    for (const sIdx of [...info.streams.keys()].sort((a, b) => a - b)) {
-      const s = info.streams.get(sIdx)!;
-      const kind = s.get(1) ?? "?";
-      const lang = s.get(3) ?? "---";
-      const codec = s.get(6) ?? s.get(5) ?? "?";
-      w(`      ${kind.padEnd(9)} ${lang.padEnd(4)} ${codec}\n`);
+  if (p.extras.length > 0) {
+    const skippedX = p.extras.filter((e) => e.skipped).length;
+    w(`  Extras:   ${p.extras.length - skippedX} remuxed${skippedX ? `, ${skippedX} skipped` : ""}\n`);
+    for (const e of p.extras) {
+      w(`    ${e.outputPath}${e.skipped ? " [skipped]" : ""}\n`);
     }
   }
-}
-
-function printDone(p: {
-  disc: DiscRow;
-  movie: Pick<MovieRow, "title" | "year">;
-  outputPath: string;
-  manifestPath: string;
-  skipped: boolean;
-  logPath: string;
-}): void {
-  const w = (s: string) => process.stdout.write(s);
-  const verb = p.skipped ? "Already remuxed" : "Remuxed";
-  w(`\n${verb}: ${p.movie.title}${p.movie.year ? ` (${p.movie.year})` : ""}\n`);
-  w(`  Output:   ${p.outputPath}\n`);
   w(`  Manifest: ${p.manifestPath}\n`);
   w(`  Log:      ${p.logPath}\n`);
 }
